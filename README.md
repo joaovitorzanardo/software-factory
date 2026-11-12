@@ -1,5 +1,54 @@
 # Software Factory
 
+## O que é
+
+Uma "fábrica de software" experimental: a ideia é que uma tarefa escrita no Linear vire código
+pronto para revisão sem que ninguém precise programar à mão.
+
+O caminho completo que queremos automatizar é:
+
+1. alguém cria uma issue no Linear descrevendo uma funcionalidade ou um bug;
+2. a fábrica escreve um **plano** de como resolver;
+3. a fábrica **implementa** o plano;
+4. a fábrica abre um **Pull Request** no GitHub para uma pessoa revisar.
+
+Hoje (fase de teste) a fábrica faz as etapas 1 e 2: ela recebe a issue, escreve o plano e salva
+esse plano numa branch do repositório. Implementar e abrir o PR ainda está por vir.
+
+Quem faz o trabalho "inteligente" é o **Claude Code**, rodando dentro de uma máquina isolada e
+descartável (sandbox do **E2B**). Quem coordena os passos, tenta de novo quando algo falha e
+garante que nada fique pela metade é o **Temporal**.
+
+## Como funciona hoje
+
+```mermaid
+flowchart TD
+    A([Pessoa cria ou edita issue no Linear<br/>com label Feature ou Bug]) --> B[Linear envia webhook]
+    B --> C{Servidor de webhooks<br/>assinatura válida e<br/>label Feature/Bug?}
+    C -- não --> C1([Ignora e responde 200])
+    C -- sim --> D{Já existe workflow<br/>para essa issue?}
+    D -- sim --> D1([Responde duplicate])
+    D -- não --> E[Inicia PlanIssueWorkflow<br/>no Temporal]
+
+    subgraph W[Worker do Temporal]
+        E --> F{Issue está em To Do?}
+        F -- sim --> F1[Move a issue para In Planning]
+        F -- não --> G
+        F1 --> G[Cria sandbox E2B]
+        G --> H[Clona o repositório alvo]
+        H --> I[Claude Code escreve o plano<br/>com a skill writing-plans]
+        I --> J[Commit e push do plano na<br/>branch factory/IDENTIFIER]
+        J --> K[Destrói o sandbox<br/>sempre, mesmo em falha]
+        K --> L[Move a issue para In Progress]
+    end
+
+    L --> M([Plano disponível no GitHub])
+    M -. próximos passos .-> N[Implementar o plano]
+    N -.-> O[Abrir Pull Request]
+```
+
+As linhas pontilhadas são etapas planejadas, ainda não implementadas.
+
 ## Requisitos
 
 - Python 3.12+
