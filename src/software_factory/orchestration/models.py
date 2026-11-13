@@ -4,6 +4,7 @@ from dataclasses import dataclass
 STATE_TODO = "To Do"
 STATE_IN_PLANNING = "In Planning"
 STATE_IN_PROGRESS = "In Progress"
+STATE_IN_REVIEW = "In Review"
 
 
 @dataclass(frozen=True)
@@ -43,3 +44,10 @@ class MoveIssueRequest:
     from_state: str | None = None
     # Status que precisam existir no time, validados antes de mover ou pular (falha cedo).
     require_states: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class PullRequestRequest:
+    identifier: str
+    title: str
+    url: str | None
