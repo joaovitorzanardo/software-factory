@@ -1,7 +1,7 @@
 import unittest
 
 from software_factory.config import DEFAULT_TRIGGER_LABELS
-from software_factory.linear.events import parse_issue, should_process
+from software_factory.linear.events import parse_issue, should_implement, should_process
 from tests.payloads import BUG, DOCS, FEATURE, issue_payload
 
 
@@ -41,6 +41,71 @@ class TestShouldProcess(unittest.TestCase):
 
     def test_non_issue_type(self) -> None:
         self.assertFalse(process(issue_payload(labels=[FEATURE], type_="Comment")))
+
+
+IN_PROGRESS = {"id": "s1", "name": "In Progress"}
+
+
+def implement(payload) -> bool:
+    return should_implement(payload, DEFAULT_TRIGGER_LABELS)
+
+
+class TestShouldImplement(unittest.TestCase):
+    def test_moved_to_in_progress_with_label(self) -> None:
+        upper = {**FEATURE, "name": "FEATURE"}
+        payload = issue_payload(
+            "update", labels=[upper], updated_from={"stateId": "s-old"}, state=IN_PROGRESS
+        )
+        self.assertTrue(implement(payload))
+        lower = {"id": "s1", "name": "in progress"}
+        payload = issue_payload(
+            "update", labels=[BUG], updated_from={"stateId": "s-old"}, state=lower
+        )
+        self.assertTrue(implement(payload))
+
+    def test_without_trigger_label(self) -> None:
+        payload = issue_payload(
+            "update", labels=[DOCS], updated_from={"stateId": "s-old"}, state=IN_PROGRESS
+        )
+        self.assertFalse(implement(payload))
+
+    def test_other_state(self) -> None:
+        payload = issue_payload(
+            "update",
+            labels=[FEATURE],
+            updated_from={"stateId": "s-old"},
+            state={"id": "s2", "name": "In Review"},
+        )
+        self.assertFalse(implement(payload))
+
+    def test_state_not_changed(self) -> None:
+        payload = issue_payload(
+            "update", labels=[FEATURE], updated_from={"title": "Antigo"}, state=IN_PROGRESS
+        )
+        self.assertFalse(implement(payload))
+
+    def test_create(self) -> None:
+        self.assertFalse(implement(issue_payload(labels=[FEATURE], state=IN_PROGRESS)))
+
+    def test_non_issue_type(self) -> None:
+        payload = issue_payload(
+            "update",
+            labels=[FEATURE],
+            updated_from={"stateId": "s-old"},
+            state=IN_PROGRESS,
+            type_="Comment",
+        )
+        self.assertFalse(implement(payload))
+
+    def test_label_added_and_moved_is_planning(self) -> None:
+        payload = issue_payload(
+            "update",
+            labels=[FEATURE],
+            updated_from={"labelIds": [], "stateId": "s-old"},
+            state=IN_PROGRESS,
+        )
+        self.assertTrue(process(payload))
+        self.assertTrue(implement(payload))
 
 
 class TestParseIssue(unittest.TestCase):

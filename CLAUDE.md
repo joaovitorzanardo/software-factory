@@ -25,7 +25,11 @@ Software factory experimental (fase de teste). O objetivo é automatizar o ciclo
   `ANTHROPIC_API_KEY` (API) ou `CLAUDE_CODE_OAUTH_TOKEN` (assinatura, `claude setup-token`;
   zona cinzenta nos termos para automação em sandbox de terceiro).
 - **Git/PR:** GitHub; um único repo alvo (`TARGET_REPO=owner/repo`), clonado no sandbox com
-  `GITHUB_TOKEN` fine-grained restrito a esse repo, com **Contents: Read and write** (push da branch do plano).
+  `GITHUB_TOKEN` fine-grained restrito a esse repo, com **Contents: Read and write** (push da
+  branch) e **Pull requests: Read and write** (abertura da PR). API REST do GitHub
+  (`https://api.github.com`) chamada com `httpx` puro (`github/client.py`, sem SDK).
+- **Testes do repo alvo:** `TEST_COMMAND` (env obrigatória do worker), rodado pelo orquestrador
+  no sandbox depois da implementação; exit 0 = verde. A PR só abre com verde.
 - **Linear API:** só GraphQL (`https://api.linear.app/graphql`, não há REST), chamada com `httpx`
   puro (`linear/client.py`, sem SDK); personal API key em `LINEAR_API_KEY` (worker), com escrita em issues.
 - **Planejamento:** skill `writing-plans` do superpowers 7.0.0, vendorizada em
@@ -46,13 +50,20 @@ src/software_factory/
     client.py         # LinearClient: POST GraphQL com httpx; erros → ApplicationError (retentável ou não)
     signature.py      # validação HMAC do Linear-Signature + anti-replay
     events.py         # LinearIssue, should_process (filtro por label), parse_issue
-    webhook.py        # POST /webhooks/linear; handle_issue inicia o PlanIssueWorkflow
+    webhook.py        # POST /webhooks/linear; handle_issue inicia o PlanIssueWorkflow ou o ImplementIssueWorkflow
+  github/
+    client.py         # GitHubClient: REST com httpx (default_branch, get_file, find_open_pull, create_pull)
   orchestration/
     models.py         # dataclasses de entrada/saída (PlanIssueInput, PlanRequest, CommitPlanRequest,
-                      # MoveIssueRequest, PlanResult) e nomes dos status (STATE_*)
-    activities.py     # SandboxActivities: create_sandbox, clone_repo, generate_plan, commit_plan, kill_sandbox
+                      # MoveIssueRequest, PlanResult, CloneBranchRequest, ImplementRequest, TestRunResult,
+                      # CommitImplementationRequest, PullRequestRequest, ImplementResult), STATE_* e OUTCOME_*
+    activities.py     # SandboxActivities: create_sandbox, clone_repo, generate_plan, commit_plan,
+                      # clone_branch, implement_plan, run_tests, commit_implementation, kill_sandbox
     linear_activities.py  # LinearActivities.move_issue: muda o status da issue (por nome, no time dela)
+    github_activities.py  # GitHubActivities: plan_exists, open_pull_request
     workflow.py       # PlanIssueWorkflow: In Planning → sandbox → clone → plano → commit → kill (finally) → In Progress
+    implement_workflow.py # ImplementIssueWorkflow: plano existe? → sandbox → clone da branch → implementa →
+                      # testes → push → kill (finally) → PR → In Review
     skills/writing-plans/  # SKILL.md + LICENSE vendorizados do superpowers
     worker.py         # entrypoint `software-factory-worker`
 tests/                # unittest; payloads.py tem fixtures no formato do Linear
@@ -60,16 +71,27 @@ tests/                # unittest; payloads.py tem fixtures no formato do Linear
 
 ## Webhook do Linear
 
-- Gatilho: issue `create` com label `Feature` ou `Bug` (case-insensitive), ou `update`
-  em que uma dessas labels foi adicionada (`updatedFrom.labelIds`).
+- Gatilho do planejamento: issue `create` com label `Feature` ou `Bug` (case-insensitive), ou
+  `update` em que uma dessas labels foi adicionada (`updatedFrom.labelIds`).
+- Gatilho da implementação: `update` com `stateId` em `updatedFrom` e `data.state.name ==
+  "In Progress"` (case-insensitive), em issue com label de gatilho. Evento que adiciona a label
+  **e** muda o status dispara só o planejamento.
 - Eventos ignorados retornam 200 para o Linear não reenviar.
-- `handle_issue` inicia o `PlanIssueWorkflow` com id `plan-issue-<issue.id>`; se já houver um
-  rodando responde `{"status": "duplicate"}`; se o Temporal estiver fora, 503 (o Linear reenvia).
+- `handle_issue` inicia o `PlanIssueWorkflow` com id `plan-issue-<issue.id>` (ou o
+  `ImplementIssueWorkflow` com id `implement-issue-<issue.id>`); se já houver um rodando responde
+  `{"status": "duplicate"}`; se o Temporal estiver fora, 503 (o Linear reenvia).
 - O workflow hoje **gera o plano** com a skill `writing-plans` e o **commita** em
   `docs/superpowers/plans/<IDENTIFIER>.md` na branch `factory/<IDENTIFIER>` (push feito pela
   activity `commit_plan`; o Claude só tem permissão `Edit` nesse arquivo, sem `Bash`). Se a branch
-  já existir no remoto com outro conteúdo, falha sem force push. Implementação e abertura de PR
-  ainda **fora do escopo**.
+  já existir no remoto com outro conteúdo, falha sem force push.
+- O `ImplementIssueWorkflow` confere que a issue segue em `In Progress` (senão encerra), checa o
+  plano via API do GitHub antes de criar sandbox (sem plano → move para `In Planning`), clona
+  `factory/<IDENTIFIER>` com o token **fora** do `origin`, roda o Claude com `Bash`
+  (`implement_plan`, 30 min, sem retry), roda `TEST_COMMAND` (`run_tests`), e só com verde faz
+  push (`commit_implementation`, sem force push; falha se o Claude não mudou nada), destrói o
+  sandbox, abre a PR `factory/<ID>` → branch default (reaproveita PR aberta) e move para
+  `In Review`. Testes vermelhos ou qualquer falha: sem PR, sem compensação, issue fica em
+  `In Progress`.
 - Status no Linear: o workflow começa movendo a issue `To Do → In Planning` (só se estiver em
   `To Do`; senão planeja sem mover) e, depois do commit do plano e do kill do sandbox, move para
   `In Progress`. Status procurados por nome (case-insensitive) no time da issue; status inexistente
@@ -85,7 +107,7 @@ uv venv .venv && source .venv/bin/activate && uv pip install -e ".[dev]"
 # servidor Temporal local (terminal separado) — gRPC localhost:7233, UI http://localhost:8233
 temporal server start-dev
 
-# worker do Temporal (lê .env; precisa de E2B_API_KEY, ANTHROPIC_API_KEY ou CLAUDE_CODE_OAUTH_TOKEN, GITHUB_TOKEN, TARGET_REPO, LINEAR_API_KEY)
+# worker do Temporal (lê .env; precisa de E2B_API_KEY, ANTHROPIC_API_KEY ou CLAUDE_CODE_OAUTH_TOKEN, GITHUB_TOKEN, TARGET_REPO, LINEAR_API_KEY, TEST_COMMAND)
 software-factory-worker
 
 # servidor de webhooks (lê .env)

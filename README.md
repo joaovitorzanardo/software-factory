@@ -12,8 +12,9 @@ O caminho completo que queremos automatizar é:
 3. a fábrica **implementa** o plano;
 4. a fábrica abre um **Pull Request** no GitHub para uma pessoa revisar.
 
-Hoje (fase de teste) a fábrica faz as etapas 1 e 2: ela recebe a issue, escreve o plano e salva
-esse plano numa branch do repositório. Implementar e abrir o PR ainda está por vir.
+Hoje (fase de teste) a fábrica faz as quatro etapas: ela recebe a issue, escreve o plano e salva
+esse plano numa branch do repositório; quando a issue entra em `In Progress`, implementa o plano,
+roda os testes e, só se estiverem verdes, abre o PR e move a issue para `In Review`.
 
 Quem faz o trabalho "inteligente" é o **Claude Code**, rodando dentro de uma máquina isolada e
 descartável (sandbox do **E2B**). Quem coordena os passos, tenta de novo quando algo falha e
@@ -26,11 +27,14 @@ flowchart TD
     A([Pessoa cria ou edita issue no Linear<br/>com label Feature ou Bug]) --> B[Linear envia webhook]
     B --> C{Servidor de webhooks<br/>assinatura válida e<br/>label Feature/Bug?}
     C -- não --> C1([Ignora e responde 200])
-    C -- sim --> D{Já existe workflow<br/>para essa issue?}
+    C -- "label adicionada<br/>ou issue criada" --> D{Já existe workflow<br/>para essa issue?}
+    C -- "status mudou para<br/>In Progress" --> P{Já existe workflow<br/>de implementação?}
     D -- sim --> D1([Responde duplicate])
     D -- não --> E[Inicia PlanIssueWorkflow<br/>no Temporal]
+    P -- sim --> D1
+    P -- não --> Q[Inicia ImplementIssueWorkflow<br/>no Temporal]
 
-    subgraph W[Worker do Temporal]
+    subgraph W[Worker do Temporal: planejamento]
         E --> F{Issue está em To Do?}
         F -- sim --> F1[Move a issue para In Planning]
         F -- não --> G
@@ -42,12 +46,24 @@ flowchart TD
         K --> L[Move a issue para In Progress]
     end
 
-    L --> M([Plano disponível no GitHub])
-    M -. próximos passos .-> N[Implementar o plano]
-    N -.-> O[Abrir Pull Request]
-```
+    L -. webhook de status .-> B
 
-As linhas pontilhadas são etapas planejadas, ainda não implementadas.
+    subgraph X[Worker do Temporal: implementação]
+        Q --> R{Issue ainda em<br/>In Progress?}
+        R -- não --> R1([Encerra sem fazer nada])
+        R -- sim --> S{Plano existe em<br/>factory/IDENTIFIER?}
+        S -- não --> S1([Move a issue de volta<br/>para In Planning])
+        S -- sim --> T[Cria sandbox E2B]
+        T --> U[Clona a branch factory/IDENTIFIER]
+        U --> V[Claude Code implementa o plano]
+        V --> Y{Testes verdes?}
+        Y -- não --> Y1([Falha; sandbox destruído,<br/>issue fica em In Progress])
+        Y -- sim --> Z[Commit e push na branch]
+        Z --> Z1[Destrói o sandbox<br/>sempre, mesmo em falha]
+        Z1 --> Z2[Abre o Pull Request]
+        Z2 --> Z3([Move a issue para In Review])
+    end
+```
 
 ## Requisitos
 
@@ -87,8 +103,9 @@ temporal server start-dev
 | `E2B_TEMPLATE` | worker | template do sandbox (default `claude`) |
 | `ANTHROPIC_API_KEY` | worker | auth do Claude Code via API (cobrança por token) |
 | `CLAUDE_CODE_OAUTH_TOKEN` | worker | alternativa: token da assinatura Claude (`claude setup-token`); defina só uma das duas |
-| `GITHUB_TOKEN` | worker | token fine-grained restrito ao repo alvo, com **Contents: Read and write** |
+| `GITHUB_TOKEN` | worker | token fine-grained restrito ao repo alvo, com **Contents: Read and write** e **Pull requests: Read and write** |
 | `TARGET_REPO` | worker | repo que a fábrica opera (`owner/repo`) |
+| `TEST_COMMAND` | worker | comando que roda os testes do repo alvo no sandbox (exit 0 = verde), ex.: `uv pip install --system -e ".[dev]" && python -m pytest` |
 | `LINEAR_API_KEY` | worker | personal API key do Linear, com escrita em issues (muda o status) |
 
 ## Worker (Temporal + E2B)
@@ -114,6 +131,25 @@ comparado sem diferenciar maiúsculas). Em falha a issue fica no status em que e
 `In Planning`. A API do Linear é só GraphQL (`https://api.linear.app/graphql`), chamada com `httpx`.
 
 O plano e a branch ficam no resultado do workflow, na UI do Temporal (http://localhost:8233).
+
+Quando a issue entra em `In Progress` (movida pelo `PlanIssueWorkflow` ou por uma pessoa), o
+`ImplementIssueWorkflow` (id `implement-issue-<issue id>`):
+
+1. confere que a issue segue em `In Progress` (senão encerra sem fazer nada) e que os status
+   `In Review` e `In Planning` existem no time;
+2. checa pela API do GitHub se o plano existe em `factory/<IDENTIFIER>`; se não existe, move a
+   issue de volta para `In Planning` e encerra, sem criar sandbox;
+3. cria um sandbox E2B e clona a branch `factory/<IDENTIFIER>` — o `origin` fica sem o token,
+   porque o Claude roda com `Bash` liberado;
+4. roda `claude -p` para implementar o plano (até 30 min, sem retry);
+5. roda `TEST_COMMAND` no repo (o orquestrador não confia no relato do Claude); com testes
+   vermelhos o workflow falha, sem push nem PR;
+6. commita o que faltar e faz push na branch (só a activity tem o token);
+7. destrói o sandbox (sempre, inclusive em falha);
+8. abre o PR `factory/<IDENTIFIER>` → branch default pela API REST do GitHub (reaproveita um PR
+   já aberto) e move a issue para `In Review`.
+
+Em falha a issue fica em `In Progress`.
 
 ## Executar (servidor de webhooks)
 
@@ -145,10 +181,12 @@ No Linear: **Settings → API → Webhooks → New webhook**
 - Copie o *signing secret* para `LINEAR_WEBHOOK_SECRET` no `.env`
 
 O endpoint valida a assinatura (`Linear-Signature`, 401 se inválida) e o
-`webhookTimestamp` (400 se tiver mais de 60s), e aceita apenas issues **criadas**
-com label `Feature`/`Bug` ou **atualizadas** recebendo uma dessas labels. Os demais
-eventos retornam 200 `{"status": "ignored"}`. Issues aceitas iniciam o workflow
-(`{"status": "accepted"}`, ou `"duplicate"` se já houver um rodando para a issue);
+`webhookTimestamp` (400 se tiver mais de 60s). Com label `Feature`/`Bug`, issues **criadas**
+ou **atualizadas** recebendo uma dessas labels iniciam o planejamento, e issues cujo status
+**mudou para `In Progress`** iniciam a implementação (se o mesmo evento adiciona a label e muda
+o status, vale só o planejamento). Os demais eventos retornam 200 `{"status": "ignored"}`.
+Issues aceitas iniciam o workflow (`{"status": "accepted"}`, ou `"duplicate"` se já houver um
+rodando para a issue);
 se o Temporal estiver indisponível, responde 503 para o Linear reenviar.
 
 ## Testes

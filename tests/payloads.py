@@ -13,6 +13,7 @@ def issue_payload(
     updated_from: dict[str, Any] | None = None,
     webhook_timestamp: int = 0,
     type_: str = "Issue",
+    state: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     labels = labels or []
     payload: dict[str, Any] = {
@@ -30,6 +31,8 @@ def issue_payload(
             "labels": labels,
         },
     }
+    if state is not None:
+        payload["data"]["state"] = state
     if updated_from is not None:
         payload["updatedFrom"] = updated_from
     return payload

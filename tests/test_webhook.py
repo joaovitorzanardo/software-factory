@@ -8,6 +8,8 @@ from temporalio.exceptions import WorkflowAlreadyStartedError
 
 from software_factory.api import create_app
 from software_factory.config import Settings
+from software_factory.orchestration.implement_workflow import ImplementIssueWorkflow
+from software_factory.orchestration.workflow import PlanIssueWorkflow
 from tests.payloads import DOCS, FEATURE, issue_payload
 from tests.test_signature import SECRET, sign
 
@@ -91,6 +93,38 @@ class TestLinearWebhook(unittest.TestCase):
         self.assertEqual(issue_input.identifier, "ENG-12")
         self.assertEqual(kwargs["id"], f"plan-issue-{issue_input.issue_id}")
         self.assertEqual(kwargs["task_queue"], "software-factory")
+
+    def in_progress_body(self, labels, updated_from) -> bytes:
+        payload = issue_payload(
+            "update",
+            labels=labels,
+            updated_from=updated_from,
+            state={"id": "s1", "name": "In Progress"},
+            webhook_timestamp=now_ms(),
+        )
+        return json.dumps(payload).encode()
+
+    def test_in_progress_starts_implement_workflow(self) -> None:
+        response = self.post(self.in_progress_body([FEATURE], {"stateId": "s-old"}))
+        self.assertEqual(response.json(), {"status": "accepted"})
+        ((args, kwargs),) = self.temporal.started
+        self.assertIs(args[0], ImplementIssueWorkflow.run)
+        self.assertEqual(kwargs["id"], "implement-issue-issue-uuid")
+        self.assertEqual(args[1].identifier, "ENG-12")
+
+    def test_label_added_and_in_progress_starts_plan(self) -> None:
+        response = self.post(
+            self.in_progress_body([FEATURE], {"labelIds": [], "stateId": "s-old"})
+        )
+        self.assertEqual(response.json(), {"status": "accepted"})
+        ((args, kwargs),) = self.temporal.started
+        self.assertIs(args[0], PlanIssueWorkflow.run)
+        self.assertTrue(kwargs["id"].startswith("plan-issue-"))
+
+    def test_in_progress_without_label_is_ignored(self) -> None:
+        response = self.post(self.in_progress_body([DOCS], {"stateId": "s-old"}))
+        self.assertEqual(response.json(), {"status": "ignored"})
+        self.assertEqual(self.temporal.started, [])
 
     def test_already_started(self) -> None:
         temporal = FakeTemporalClient(WorkflowAlreadyStartedError("plan-issue-x", "PlanIssueWorkflow"))

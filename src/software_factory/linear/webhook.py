@@ -8,8 +8,14 @@ from fastapi import APIRouter, HTTPException, Request
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
 from software_factory.config import Settings
-from software_factory.linear.events import LinearIssue, parse_issue, should_process
+from software_factory.linear.events import (
+    LinearIssue,
+    parse_issue,
+    should_implement,
+    should_process,
+)
 from software_factory.linear.signature import is_fresh, verify_signature
+from software_factory.orchestration.implement_workflow import ImplementIssueWorkflow
 from software_factory.orchestration.models import PlanIssueInput
 from software_factory.orchestration.workflow import PlanIssueWorkflow
 
@@ -19,13 +25,18 @@ router = APIRouter()
 
 
 async def handle_issue(
-    client: Any, task_queue: str, issue: LinearIssue, delivery_id: str | None
+    client: Any,
+    task_queue: str,
+    issue: LinearIssue,
+    delivery_id: str | None,
+    workflow_run: Any = PlanIssueWorkflow.run,
+    id_prefix: str = "plan-issue",
 ) -> bool:
-    """Inicia o PlanIssueWorkflow; retorna False se já há um rodando para a issue."""
-    workflow_id = f"plan-issue-{issue.id}"
+    """Inicia o workflow da issue; retorna False se já há um rodando para ela."""
+    workflow_id = f"{id_prefix}-{issue.id}"
     try:
         await client.start_workflow(
-            PlanIssueWorkflow.run,
+            workflow_run,
             PlanIssueInput(
                 issue_id=issue.id,
                 identifier=issue.identifier,
@@ -69,7 +80,15 @@ async def linear_webhook(request: Request) -> dict[str, str]:
         raise HTTPException(status_code=400, detail="webhookTimestamp ausente ou expirado")
 
     delivery_id = request.headers.get("Linear-Delivery")
-    if not should_process(payload, settings.trigger_labels):
+    # Label adicionada e status mudado no mesmo evento: o planejamento vence.
+    if should_process(payload, settings.trigger_labels):
+        workflow_kwargs: dict[str, Any] = {}
+    elif should_implement(payload, settings.trigger_labels):
+        workflow_kwargs = {
+            "workflow_run": ImplementIssueWorkflow.run,
+            "id_prefix": "implement-issue",
+        }
+    else:
         logger.debug(
             "evento ignorado: %s %s delivery=%s",
             payload.get("type"),
@@ -80,7 +99,11 @@ async def linear_webhook(request: Request) -> dict[str, str]:
 
     try:
         started = await handle_issue(
-            request.app.state.temporal, settings.task_queue, parse_issue(payload), delivery_id
+            request.app.state.temporal,
+            settings.task_queue,
+            parse_issue(payload),
+            delivery_id,
+            **workflow_kwargs,
         )
     except Exception:
         # 503 faz o Linear reenviar quando o Temporal voltar.
