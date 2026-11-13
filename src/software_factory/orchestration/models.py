@@ -78,3 +78,15 @@ class CommitImplementationRequest:
     identifier: str
     # Commit clonado de factory/<ID>: HEAD igual a ele = Claude não mudou nada.
     base_sha: str
+
+
+OUTCOME_PR_OPENED = "pr_opened"
+OUTCOME_NO_PLAN = "no_plan"
+OUTCOME_SKIPPED = "skipped"
+
+
+@dataclass(frozen=True)
+class ImplementResult:
+    identifier: str
+    outcome: str
+    pr_url: str | None = None
