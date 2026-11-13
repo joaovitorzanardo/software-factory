@@ -51,3 +51,30 @@ class PullRequestRequest:
     identifier: str
     title: str
     url: str | None
+
+
+@dataclass(frozen=True)
+class CloneBranchRequest:
+    sandbox_id: str
+    identifier: str
+
+
+@dataclass(frozen=True)
+class ImplementRequest:
+    sandbox_id: str
+    issue: PlanIssueInput
+
+
+@dataclass(frozen=True)
+class TestRunResult:
+    passed: bool
+    # Fim da saída (stdout + stderr) do comando de testes.
+    output: str
+
+
+@dataclass(frozen=True)
+class CommitImplementationRequest:
+    sandbox_id: str
+    identifier: str
+    # Commit clonado de factory/<ID>: HEAD igual a ele = Claude não mudou nada.
+    base_sha: str

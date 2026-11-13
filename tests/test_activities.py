@@ -5,7 +5,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 from unittest import mock
 
-from e2b import FileNotFoundException
+from e2b import CommandExitException, FileNotFoundException
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
@@ -13,10 +13,19 @@ from software_factory.config import FactorySettings
 from software_factory.orchestration.activities import (
     REPO_DIR,
     SandboxActivities,
+    build_implement_prompt,
     build_plan_prompt,
     plan_path,
 )
-from software_factory.orchestration.models import CommitPlanRequest, PlanIssueInput, PlanRequest
+from software_factory.orchestration.models import (
+    CloneBranchRequest,
+    CommitImplementationRequest,
+    CommitPlanRequest,
+    ImplementRequest,
+    PlanIssueInput,
+    PlanRequest,
+    TestRunResult,
+)
 
 SETTINGS = FactorySettings(
     e2b_api_key="e2b-key",
@@ -24,6 +33,7 @@ SETTINGS = FactorySettings(
     github_token="gh-token",
     target_repo="acme/app",
     linear_api_key="lin-key",
+    test_command="python -m pytest",
 )
 
 ISSUE = PlanIssueInput(
@@ -46,11 +56,19 @@ class FakeCommands:
     stdout: str = ""
     # substring do comando -> stdout; a primeira chave contida no comando vence.
     responses: dict[str, str] = field(default_factory=dict)
+    # substring do comando -> (stdout, stderr, exit_code): levanta CommandExitException.
+    fail: dict[str, tuple[str, str, int]] = field(default_factory=dict)
     on_run: Callable[[str], None] | None = None
     runs: list[dict[str, Any]] = field(default_factory=list)
 
     async def run(self, cmd: str, **kwargs: Any) -> FakeResult:
         self.runs.append({"cmd": cmd, **kwargs})
+        failure = next((out for key, out in self.fail.items() if key in cmd), None)
+        if failure:
+            stdout, stderr, exit_code = failure
+            raise CommandExitException(
+                stderr=stderr, stdout=stdout, exit_code=exit_code, error=None
+            )
         stdout = next((out for key, out in self.responses.items() if key in cmd), self.stdout)
         on_stdout = kwargs.get("on_stdout")
         if on_stdout and stdout:
@@ -139,12 +157,27 @@ class TestFactorySettings(unittest.TestCase):
             "ANTHROPIC_API_KEY": "anthropic-key",
             "GITHUB_TOKEN": "gh-token",
             "TARGET_REPO": "acme/app",
+            "TEST_COMMAND": "make test",
         }
         with mock.patch.dict(os.environ, env, clear=True):
             with self.assertRaises(RuntimeError):
                 FactorySettings.from_env()
         with mock.patch.dict(os.environ, {**env, "LINEAR_API_KEY": "lin-key"}, clear=True):
             self.assertEqual(FactorySettings.from_env().linear_api_key, "lin-key")
+
+    def test_from_env_requires_test_command(self) -> None:
+        env = {
+            "E2B_API_KEY": "e2b-key",
+            "ANTHROPIC_API_KEY": "anthropic-key",
+            "GITHUB_TOKEN": "gh-token",
+            "TARGET_REPO": "acme/app",
+            "LINEAR_API_KEY": "lin-key",
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(RuntimeError):
+                FactorySettings.from_env()
+        with mock.patch.dict(os.environ, {**env, "TEST_COMMAND": "make test"}, clear=True):
+            self.assertEqual(FactorySettings.from_env().test_command, "make test")
 
 
 class TestBuildPlanPrompt(unittest.TestCase):
@@ -163,6 +196,21 @@ class TestBuildPlanPrompt(unittest.TestCase):
         prompt = build_plan_prompt(ISSUE)
         self.assertIn("writing-plans", prompt)
         self.assertIn("docs/superpowers/plans/ENG-12.md", prompt)
+
+
+class TestBuildImplementPrompt(unittest.TestCase):
+    def test_implement_prompt(self) -> None:
+        prompt = build_implement_prompt(ISSUE, "python -m pytest")
+        self.assertIn("ENG-12", prompt)
+        self.assertIn("Adicionar login", prompt)
+        self.assertIn("Login com e-mail e senha.", prompt)
+        self.assertIn("docs/superpowers/plans/ENG-12.md", prompt)
+        self.assertIn("python -m pytest", prompt)
+        self.assertIn("push", prompt)
+
+    def test_missing_description(self) -> None:
+        issue = PlanIssueInput("issue-1", "ENG-12", "Título", None, None)
+        self.assertIn("sem descrição", build_implement_prompt(issue, "make test"))
 
 
 class TestPlanPath(unittest.TestCase):
@@ -330,6 +378,128 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
                 CommitPlanRequest(sandbox_id="sbx-1", identifier="ENG-12"),
             )
         self.assertEqual(self.commands(), [])
+
+    async def test_clone_branch(self) -> None:
+        FakeSandbox.instance.commands.responses = {"rev-parse": "abc123\n"}
+        sha = await self.env.run(
+            self.activities.clone_branch, CloneBranchRequest(sandbox_id="sbx-1", identifier="ENG-12")
+        )
+        self.assertEqual(sha, "abc123")
+        runs = FakeSandbox.instance.commands.runs
+        self.assertIn("git clone --depth 1 --branch factory/ENG-12", runs[0]["cmd"])
+        self.assertIn("$GITHUB_TOKEN@github.com/acme/app.git", runs[0]["cmd"])
+        self.assertEqual(runs[0]["envs"], {"GITHUB_TOKEN": "gh-token"})
+        self.assertEqual(
+            self.commands()[1:],
+            [
+                "git remote set-url origin https://github.com/acme/app.git",
+                'git config user.name "software-factory"',
+                'git config user.email "software-factory@users.noreply.github.com"',
+                "git rev-parse refs/remotes/origin/factory/ENG-12",
+            ],
+        )
+        for run in runs:
+            self.assertNotIn("gh-token", run["cmd"])
+        for run in runs[1:]:
+            self.assertEqual(run["cwd"], REPO_DIR)
+
+    async def test_clone_branch_retry_skips_clone_but_resets_origin(self) -> None:
+        FakeSandbox.instance.files.existing.add(f"{REPO_DIR}/.git")
+        FakeSandbox.instance.commands.responses = {"rev-parse": "abc123\n"}
+        await self.env.run(
+            self.activities.clone_branch, CloneBranchRequest(sandbox_id="sbx-1", identifier="ENG-12")
+        )
+        commands = self.commands()
+        self.assertFalse(any("git clone" in cmd for cmd in commands))
+        self.assertIn("git remote set-url origin https://github.com/acme/app.git", commands)
+        self.assertEqual(commands[-1], "git rev-parse refs/remotes/origin/factory/ENG-12")
+
+    async def test_implement_plan(self) -> None:
+        FakeSandbox.instance.commands.stdout = stream(
+            {"type": "assistant", "message": {}},
+            {"type": "result", "subtype": "success", "result": "Implementado."},
+        )
+        result = await self.env.run(
+            self.activities.implement_plan, ImplementRequest(sandbox_id="sbx-1", issue=ISSUE)
+        )
+        self.assertEqual(result, "Implementado.")
+        self.assertIn("ENG-12", FakeSandbox.instance.files.written["/home/user/implement-prompt.md"])
+        (run,) = FakeSandbox.instance.commands.runs
+        self.assertIn("cat /home/user/implement-prompt.md | claude -p", run["cmd"])
+        self.assertIn("--output-format stream-json", run["cmd"])
+        self.assertIn("Bash", run["cmd"])
+        self.assertEqual(run["cwd"], REPO_DIR)
+        self.assertTrue(self.heartbeats)
+
+    async def test_implement_plan_error_result(self) -> None:
+        FakeSandbox.instance.commands.stdout = stream(
+            {"type": "result", "subtype": "error_max_turns", "is_error": True}
+        )
+        with self.assertRaises(ApplicationError):
+            await self.env.run(
+                self.activities.implement_plan, ImplementRequest(sandbox_id="sbx-1", issue=ISSUE)
+            )
+
+    async def test_run_tests_green(self) -> None:
+        FakeSandbox.instance.commands.stdout = "5 passed"
+        result = await self.env.run(self.activities.run_tests, "sbx-1")
+        self.assertEqual(result, TestRunResult(True, "5 passed"))
+        (run,) = FakeSandbox.instance.commands.runs
+        self.assertEqual(run["cmd"], "python -m pytest")
+        self.assertEqual(run["cwd"], REPO_DIR)
+
+    async def test_run_tests_red(self) -> None:
+        FakeSandbox.instance.commands.fail = {"pytest": ("x" * 5000, "FAILED test_a", 1)}
+        result = await self.env.run(self.activities.run_tests, "sbx-1")
+        self.assertFalse(result.passed)
+        self.assertEqual(len(result.output), 4000)
+        self.assertTrue(result.output.endswith("FAILED test_a"))
+
+    async def run_commit_implementation(self, head: str, remote: str) -> str:
+        FakeSandbox.instance.commands.responses = {"rev-parse": head, "ls-remote": remote}
+        return await self.env.run(
+            self.activities.commit_implementation,
+            CommitImplementationRequest(sandbox_id="sbx-1", identifier="ENG-12", base_sha="abc123"),
+        )
+
+    async def test_commit_implementation_pushes(self) -> None:
+        branch = await self.run_commit_implementation(
+            "def456\n", "abc123\trefs/heads/factory/ENG-12\n"
+        )
+        self.assertEqual(branch, "factory/ENG-12")
+        runs = FakeSandbox.instance.commands.runs
+        self.assertEqual(runs[0]["cmd"], "git add -A")
+        self.assertIn('git commit -m "feat: implementa ENG-12"', runs[1]["cmd"])
+        self.assertEqual(
+            runs[-1]["cmd"],
+            'git push "https://x-access-token:$GITHUB_TOKEN@github.com/acme/app.git"'
+            " HEAD:refs/heads/factory/ENG-12",
+        )
+        self.assertEqual(runs[-1]["envs"], {"GITHUB_TOKEN": "gh-token"})
+        ls_remote = next(run for run in runs if "ls-remote" in run["cmd"])
+        self.assertEqual(ls_remote["envs"], {"GITHUB_TOKEN": "gh-token"})
+        for run in runs:
+            self.assertNotIn("gh-token", run["cmd"])
+            self.assertEqual(run["cwd"], REPO_DIR)
+
+    async def test_commit_implementation_idempotent_after_push(self) -> None:
+        branch = await self.run_commit_implementation(
+            "def456\n", "def456\trefs/heads/factory/ENG-12\n"
+        )
+        self.assertEqual(branch, "factory/ENG-12")
+        self.assertFalse(any("git push" in cmd for cmd in self.commands()))
+
+    async def test_commit_implementation_rejects_no_changes(self) -> None:
+        with self.assertRaises(ApplicationError) as ctx:
+            await self.run_commit_implementation("abc123\n", "abc123\trefs/heads/factory/ENG-12\n")
+        self.assertTrue(ctx.exception.non_retryable)
+        self.assertFalse(any("ls-remote" in cmd or "git push" in cmd for cmd in self.commands()))
+
+    async def test_commit_implementation_rejects_moved_remote(self) -> None:
+        with self.assertRaises(ApplicationError) as ctx:
+            await self.run_commit_implementation("def456\n", "zzz999\trefs/heads/factory/ENG-12\n")
+        self.assertTrue(ctx.exception.non_retryable)
+        self.assertFalse(any("git push" in cmd for cmd in self.commands()))
 
     async def test_kill_sandbox(self) -> None:
         await self.env.run(self.activities.kill_sandbox, "sbx-1")
