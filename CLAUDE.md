@@ -86,7 +86,8 @@ tests/                # unittest; payloads.py tem fixtures no formato do Linear
   já existir no remoto com outro conteúdo, falha sem force push.
 - O `ImplementIssueWorkflow` confere que a issue segue em `In Progress` (senão encerra), checa o
   plano via API do GitHub antes de criar sandbox (sem plano → move para `In Planning`), clona
-  `factory/<IDENTIFIER>` com o token **fora** do `origin`, roda o Claude com `Bash`
+  `factory/<IDENTIFIER>` com o token **fora** do `origin` (defesa parcial: o push roda depois no
+  mesmo sandbox em que o Claude teve `Bash`, então o token deve ser tratado como exposto), roda o Claude com `Bash`
   (`implement_plan`, 30 min, sem retry), roda `TEST_COMMAND` (`run_tests`), e só com verde faz
   push (`commit_implementation`, sem force push; falha se o Claude não mudou nada), destrói o
   sandbox, abre a PR `factory/<ID>` → branch default (reaproveita PR aberta) e move para

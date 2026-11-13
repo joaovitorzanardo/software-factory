@@ -139,12 +139,13 @@ Quando a issue entra em `In Progress` (movida pelo `PlanIssueWorkflow` ou por um
    `In Review` e `In Planning` existem no time;
 2. checa pela API do GitHub se o plano existe em `factory/<IDENTIFIER>`; se não existe, move a
    issue de volta para `In Planning` e encerra, sem criar sandbox;
-3. cria um sandbox E2B e clona a branch `factory/<IDENTIFIER>` — o `origin` fica sem o token,
-   porque o Claude roda com `Bash` liberado;
+3. cria um sandbox E2B e clona a branch `factory/<IDENTIFIER>` — o `origin` fica sem o token
+   (o Claude roda com `Bash` liberado; isso dificulta, mas não impede, que ele chegue ao token,
+   já que o push depois roda no mesmo sandbox);
 4. roda `claude -p` para implementar o plano (até 30 min, sem retry);
 5. roda `TEST_COMMAND` no repo (o orquestrador não confia no relato do Claude); com testes
    vermelhos o workflow falha, sem push nem PR;
-6. commita o que faltar e faz push na branch (só a activity tem o token);
+6. commita o que faltar e faz push na branch (o token só entra no ambiente desse comando);
 7. destrói o sandbox (sempre, inclusive em falha);
 8. abre o PR `factory/<IDENTIFIER>` → branch default pela API REST do GitHub (reaproveita um PR
    já aberto) e move a issue para `In Review`.
