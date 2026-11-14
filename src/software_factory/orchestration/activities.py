@@ -155,13 +155,14 @@ class SandboxActivities:
 
     @activity.defn
     async def create_sandbox(self, issue_id: str) -> str:
-        # idempotency_key = workflow_id: um retry reaproveita o mesmo sandbox.
+        # Mesma chave em retry da mesma activity (mesmo sandbox); sessão e execução novas têm outra.
+        info = activity.info()
         sandbox = await self.sandbox_cls.create(
             template=self.settings.e2b_template,
             timeout=SANDBOX_TIMEOUT_S,
             envs=self.settings.claude_auth_env,
             metadata={"issue_id": issue_id},
-            idempotency_key=activity.info().workflow_id,
+            idempotency_key=f"{info.workflow_id}:{info.workflow_run_id}:{info.activity_id}",
             api_key=self.settings.e2b_api_key,
         )
         activity.logger.info("sandbox criado: %s", sandbox.sandbox_id)
@@ -295,13 +296,14 @@ class SandboxActivities:
             )
             return result.stdout.strip()
 
+        message = request.message or f"feat: implementa {request.identifier}"
         await git("git add -A")
-        await git(
-            f'git diff --cached --quiet || git commit -m "feat: implementa {request.identifier}"'
-        )
+        await git(f'git diff --cached --quiet || git commit -m "{message}"')
         local_sha = await git("git rev-parse HEAD")
         if local_sha == request.base_sha:
-            raise ApplicationError("Claude Code não fez mudanças", non_retryable=True)
+            if request.require_changes:
+                raise ApplicationError("Claude Code não fez mudanças", non_retryable=True)
+            return branch
         remote = await git(
             f"git ls-remote --heads {self._authed_url()} refs/heads/{branch}", envs=token_env
         )

@@ -239,7 +239,11 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call["template"], "claude")
         self.assertEqual(call["envs"], {"ANTHROPIC_API_KEY": "anthropic-key"})
         self.assertEqual(call["metadata"], {"issue_id": "issue-1"})
-        self.assertEqual(call["idempotency_key"], self.env.info.workflow_id)
+        info = self.env.info
+        self.assertEqual(
+            call["idempotency_key"],
+            f"{info.workflow_id}:{info.workflow_run_id}:{info.activity_id}",
+        )
         self.assertEqual(call["api_key"], "e2b-key")
 
     async def test_create_sandbox_with_oauth_token(self) -> None:
@@ -455,12 +459,35 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result.output), 4000)
         self.assertTrue(result.output.endswith("FAILED test_a"))
 
-    async def run_commit_implementation(self, head: str, remote: str) -> str:
+    async def run_commit_implementation(self, head: str, remote: str, **kwargs: Any) -> str:
         FakeSandbox.instance.commands.responses = {"rev-parse": head, "ls-remote": remote}
         return await self.env.run(
             self.activities.commit_implementation,
-            CommitImplementationRequest(sandbox_id="sbx-1", identifier="ENG-12", base_sha="abc123"),
+            CommitImplementationRequest(
+                sandbox_id="sbx-1", identifier="ENG-12", base_sha="abc123", **kwargs
+            ),
         )
+
+    async def test_commit_implementation_checkpoint_message(self) -> None:
+        await self.run_commit_implementation(
+            "def456\n",
+            "abc123\trefs/heads/factory/ENG-12\n",
+            message="wip: tentativa 1 de ENG-12 (testes vermelhos)",
+            require_changes=False,
+        )
+        runs = FakeSandbox.instance.commands.runs
+        commit = next(r["cmd"] for r in runs if "git commit" in r["cmd"])
+        self.assertIn('-m "wip: tentativa 1 de ENG-12 (testes vermelhos)"', commit)
+        self.assertTrue(any("git push" in r["cmd"] for r in runs))
+
+    async def test_commit_implementation_no_changes_allowed(self) -> None:
+        result = await self.run_commit_implementation(
+            "abc123\n", "abc123\trefs/heads/factory/ENG-12\n", require_changes=False
+        )
+        self.assertEqual(result, "factory/ENG-12")
+        runs = FakeSandbox.instance.commands.runs
+        self.assertFalse(any("git push" in r["cmd"] for r in runs))
+        self.assertFalse(any("ls-remote" in r["cmd"] for r in runs))
 
     async def test_commit_implementation_pushes(self) -> None:
         branch = await self.run_commit_implementation(
