@@ -8,7 +8,12 @@ from temporalio.testing import ActivityEnvironment
 
 from software_factory.linear.client import LinearClient
 from software_factory.orchestration.linear_activities import LinearActivities
-from software_factory.orchestration.models import CommentRequest, MoveIssueRequest
+from software_factory.orchestration.models import (
+    CommentRequest,
+    CreateIssueRequest,
+    FollowUpIssue,
+    MoveIssueRequest,
+)
 
 TEAM_STATES = [
     {"id": "state-todo", "name": "To Do"},
@@ -178,6 +183,79 @@ class TestPostComment(unittest.IsolatedAsyncioTestCase):
                 CommentRequest("issue-1", "c-1", "Pergunta?"),
                 {"data": {"issue": {"comments": {"nodes": []}}}},
                 {"data": {"commentCreate": {"success": False, "comment": None}}},
+            )
+        self.assertFalse(ctx.exception.non_retryable)
+
+
+class TestCreateIssue(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.requests: list[httpx.Request] = []
+        self.responses: list[dict[str, Any]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.requests.append(request)
+            return httpx.Response(200, json=self.responses.pop(0))
+
+        client = LinearClient("lin-key", transport=httpx.MockTransport(handler))
+        self.activities = LinearActivities(client)
+        self.request = CreateIssueRequest("issue-1", "new-1", "Follow-up", "Detalhes")
+
+    async def run_create(self, *responses: dict[str, Any]) -> FollowUpIssue:
+        self.responses.extend(responses)
+        return await ActivityEnvironment().run(self.activities.create_issue, self.request)
+
+    def variables(self, index: int) -> dict[str, Any]:
+        return json.loads(self.requests[index].content)["variables"]
+
+    def create_responses(self) -> tuple[dict[str, Any], ...]:
+        return (
+            {"data": {"issues": {"nodes": []}}},
+            {"data": {"issue": {"team": {"id": "team-1"}}}},
+            {
+                "data": {
+                    "issueCreate": {
+                        "success": True,
+                        "issue": {"identifier": "SW-9", "url": "https://linear.app/x/SW-9"},
+                    }
+                }
+            },
+        )
+
+    async def test_creates_issue_in_origin_team(self) -> None:
+        result = await self.run_create(*self.create_responses())
+        self.assertEqual(result, FollowUpIssue("SW-9", "https://linear.app/x/SW-9"))
+        self.assertEqual(len(self.requests), 3)
+        issue_input = self.variables(2)["input"]
+        self.assertEqual(issue_input["id"], "new-1")
+        self.assertEqual(issue_input["teamId"], "team-1")
+        self.assertEqual(issue_input["title"], "Follow-up")
+        self.assertEqual(issue_input["description"], "Detalhes")
+
+    async def test_creates_issue_without_labels(self) -> None:
+        await self.run_create(*self.create_responses())
+        self.assertNotIn("labelIds", self.variables(2)["input"])
+
+    async def test_retry_after_create_is_noop(self) -> None:
+        result = await self.run_create(
+            {"data": {"issues": {"nodes": [{"identifier": "SW-9", "url": "https://u/SW-9"}]}}}
+        )
+        self.assertEqual(result, FollowUpIssue("SW-9", "https://u/SW-9"))
+        self.assertEqual(len(self.requests), 1)
+
+    async def test_missing_origin_is_non_retryable(self) -> None:
+        with self.assertRaises(ApplicationError) as ctx:
+            await self.run_create(
+                {"data": {"issues": {"nodes": []}}}, {"data": {"issue": None}}
+            )
+        self.assertTrue(ctx.exception.non_retryable)
+        self.assertEqual(len(self.requests), 2)
+
+    async def test_unsuccessful_create_is_retryable(self) -> None:
+        with self.assertRaises(ApplicationError) as ctx:
+            await self.run_create(
+                {"data": {"issues": {"nodes": []}}},
+                {"data": {"issue": {"team": {"id": "team-1"}}}},
+                {"data": {"issueCreate": {"success": False, "issue": None}}},
             )
         self.assertFalse(ctx.exception.non_retryable)
 
