@@ -47,6 +47,8 @@ class FakeActivities:
         answers: list[str] | None = None,
         stop_after_checks: int | None = None,
         wrong_answer_first: str | None = None,
+        flaky_check: int | None = None,
+        flaky_failures: int = 0,
     ) -> None:
         self.not_in_progress = not_in_progress
         self.no_plan = no_plan
@@ -60,6 +62,10 @@ class FakeActivities:
         self.stop_after_checks = stop_after_checks
         # Antes de cada resposta certa, manda uma resposta com question_id de outra pergunta.
         self.wrong_answer_first = wrong_answer_first
+        # Checagem de In Progress (número, contando a inicial) que falha de forma transitória
+        # flaky_failures vezes antes de responder.
+        self.flaky_check = flaky_check
+        self.flaky_failures = flaky_failures
         self.client: Client | None = None
         self.calls: list[str] = []
         self.moves: list[MoveIssueRequest] = []
@@ -80,6 +86,9 @@ class FakeActivities:
             return True
         if self.not_in_progress:
             return False
+        if self.progress_checks + 1 == self.flaky_check and self.flaky_failures > 0:
+            self.flaky_failures -= 1
+            raise ApplicationError("Linear fora do ar")
         self.progress_checks += 1
         if self.stop_after_checks is None or self.progress_checks == 1:
             return True
@@ -365,6 +374,19 @@ class TestImplementIssueWorkflow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, ImplementResult("ENG-12", "stopped"))
         self.assertEqual(len(fake.comments), 1)
         self.assertNotIn("implement_fix", fake.calls)
+
+    async def test_transient_status_check_failure_does_not_fail_workflow(self) -> None:
+        # 3ª checagem = primeiro poll da espera; falha mais vezes que MOVE_ISSUE_RETRY permite.
+        fake = FakeActivities(
+            red_runs=1,
+            stop_after_checks=1,
+            analyses=[FixAnalysis("causa", question="?")],
+            flaky_check=3,
+            flaky_failures=6,
+        )
+        result = await self.run_workflow(fake)
+        self.assertEqual(result, ImplementResult("ENG-12", "stopped"))
+        self.assertEqual(fake.flaky_failures, 0)
 
     async def test_fails_without_answer_in_seven_days(self) -> None:
         fake = FakeActivities(red_runs=1, analyses=[FixAnalysis("causa", question="?")])

@@ -40,6 +40,9 @@ ATTEMPTS_IN_PROMPT = 3
 HUMAN_ANSWER_TIMEOUT = timedelta(days=7)
 # Durante a espera, confere a cada fatia se a issue segue em In Progress.
 ANSWER_POLL_INTERVAL = timedelta(hours=1)
+# Checagem de status no loop e na espera: tentativas ilimitadas, para uma instabilidade do
+# Linear não derrubar dias de espera. ApplicationError não retentável ainda falha o workflow.
+STATUS_CHECK_RETRY = RetryPolicy(maximum_interval=timedelta(minutes=5))
 
 
 def format_question(question: str) -> str:
@@ -97,10 +100,14 @@ class ImplementIssueWorkflow:
         )
 
     async def _still_in_progress(self, issue: PlanIssueInput) -> bool:
-        return await self._move(
+        return await workflow.execute_activity(
+            "move_issue",
             MoveIssueRequest(
                 issue.issue_id, to_state=STATE_IN_PROGRESS, from_state=STATE_IN_PROGRESS
-            )
+            ),
+            start_to_close_timeout=MOVE_ISSUE_TIMEOUT,
+            retry_policy=STATUS_CHECK_RETRY,
+            result_type=bool,
         )
 
     async def _create_sandbox(self, issue: PlanIssueInput) -> str:
