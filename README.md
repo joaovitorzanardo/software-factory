@@ -143,25 +143,27 @@ Quando a issue entra em `In Progress` (movida pelo `PlanIssueWorkflow` ou por um
    `In Review` e `In Planning` existem no time;
 2. checa pela API do GitHub se o plano existe em `factory/<IDENTIFIER>`; se não existe, move a
    issue de volta para `In Planning` e encerra, sem criar sandbox;
-3. cria um sandbox E2B e clona a branch `factory/<IDENTIFIER>` — o `origin` fica sem o token
+3. cria um sandbox E2B e clona a branch `factory/<IDENTIFIER>` (últimos 50 commits) — o `origin` fica sem o token
    (o Claude roda com `Bash` liberado; isso dificulta, mas não impede, que ele chegue ao token,
    já que o push depois roda no mesmo sandbox);
 4. roda `claude -p` para implementar o plano (até 30 min, sem retry);
-5. roda `TEST_COMMAND` no repo (o orquestrador não confia no relato do Claude);
+5. roda `TEST_COMMAND` no repo (o orquestrador não confia no relato do Claude); estourar o timeout
+   de 10 min conta como vermelho;
 6. com verde, commita o que faltar e faz push na branch (o token só entra no ambiente desse
-   comando); o sandbox é destruído (sempre, inclusive em falha);
+   comando; commit e push rodam com os hooks do repo desligados); o sandbox é destruído (sempre, inclusive em falha);
 7. abre o PR `factory/<IDENTIFIER>` → branch default pela API REST do GitHub (reaproveita um PR
    já aberto) e move a issue para `In Review`.
 
 Com testes vermelhos, o workflow entra no **loop de correção**: faz push de um checkpoint
 `wip: tentativa <n> de <IDENTIFIER> (testes vermelhos)` na branch (a PR só abre com verde) e repete,
 cada passo em seu próprio sandbox, analisar a falha (skill `systematic-debugging`, vendorizada),
-planejar e corrigir, até os testes ficarem verdes. Se o Claude tiver uma dúvida que só uma pessoa
+planejar e corrigir, até os testes ficarem verdes. Uma sessão de análise ou de correção que falha
+(erro ou timeout do Claude) não encerra o loop: vira mais uma tentativa vermelha. Se o Claude tiver uma dúvida que só uma pessoa
 resolve, ou depois de 5 correções seguidas sem verde, o workflow posta uma pergunta como
 comentário na issue e espera; **responda com um reply na thread desse comentário** (sem resposta em
 7 dias o workflow falha). Para parar o loop, mova a issue para fora de `In Progress` (o status é
 conferido antes de cada tentativa e a cada hora durante a espera); nesse caso termina sem PR.
-Qualquer outra falha deixa a issue em `In Progress`.
+Qualquer outra falha (sandbox, clone, push, a implementação inicial) deixa a issue em `In Progress`.
 
 ## Executar (servidor de webhooks)
 

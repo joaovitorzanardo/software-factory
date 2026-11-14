@@ -98,9 +98,11 @@ tests/                # unittest; payloads.py tem fixtures no formato do Linear
   já existir no remoto com outro conteúdo, falha sem force push.
 - O `ImplementIssueWorkflow` confere que a issue segue em `In Progress` (senão encerra), checa o
   plano via API do GitHub antes de criar sandbox (sem plano → move para `In Planning`), clona
-  `factory/<IDENTIFIER>` com o token **fora** do `origin` (defesa parcial: o push roda depois no
+  `factory/<IDENTIFIER>` (`--depth 50`, para a análise ver o histórico recente) com o token **fora** do `origin` (defesa parcial: o push roda depois no
   mesmo sandbox em que o Claude teve `Bash`, então o token deve ser tratado como exposto), roda o Claude com `Bash`
-  (`implement_plan`, 30 min, sem retry), roda `TEST_COMMAND` (`run_tests`) e destrói o sandbox.
+  (`implement_plan`, 30 min, sem retry), roda `TEST_COMMAND` (`run_tests`; timeout de 10 min =
+  vermelho) e destrói o sandbox. Commit/push do orquestrador (`commit_plan`, `commit_implementation`)
+  rodam com `-c core.hooksPath=/dev/null`. Falha da sessão inicial (`implement_plan`) falha o workflow.
   Verde: push (`commit_implementation`, sem force push; falha se o Claude não mudou nada), abre a
   PR `factory/<ID>` → branch default (reaproveita PR aberta) e move para `In Review`.
 - **Loop de correção (vermelho):** em vez de falhar, repete analisar → planejar → corrigir → testar
@@ -109,11 +111,17 @@ tests/                # unittest; payloads.py tem fixtures no formato do Linear
   `/home/user/fix`, fora do repo) e correção (`implement_fix` + `run_tests` + commit). Sessão
   vermelha faz push de checkpoint `wip: tentativa <n> de <ID> (testes vermelhos)` em
   `factory/<ID>` (sem force push); a PR só abre com verde. Só as `ATTEMPTS_IN_PROMPT = 3` últimas
-  tentativas vão para o prompt. Prompts proíbem apagar/pular/enfraquecer testes e mudar `TEST_COMMAND`.
+  tentativas vão para o prompt (análise truncada em 3000 caracteres). Prompts proíbem
+  apagar/pular/enfraquecer testes e mudar `TEST_COMMAND`.
+- **Falha de sessão alimenta o loop:** `implement_fix` que falha (erro, timeout) vira tentativa
+  vermelha com saída `implement_fix falhou: <msg>`, com checkpoint `wip: ... (correção falhou)` de
+  melhor esforço no mesmo sandbox; `analyze_failure` que falha registra a tentativa
+  `análise falhou: <msg>` e reanalisa. Ambas contam para `MAX_FIX_ATTEMPTS`. Falhas de
+  `create_sandbox`, `clone_branch`, commit e `post_comment` ainda falham o workflow.
 - **Perguntas humanas:** se a análise gera `question.md`, ou após `MAX_FIX_ATTEMPTS = 5` correções
   seguidas sem verde (o próprio workflow pergunta; a resposta zera o contador), o workflow posta
-  um comentário no Linear (`post_comment`, id gerado com `workflow.uuid4()`) e espera o signal
-  `human_answer`. A resposta é um **reply na thread** da pergunta (`parentId` == id do comentário).
+  um comentário no Linear (`post_comment`, id gerado com `workflow.uuid4()`; vale o id devolvido) e
+  espera o signal `human_answer`. A pergunta de travamento entra nas clarificações só como rótulo curto. A resposta é um **reply na thread** da pergunta (`parentId` == id do comentário).
   Sem resposta em `HUMAN_ANSWER_TIMEOUT = 7 dias` o workflow falha.
 - **Parar o loop:** mover a issue para fora de `In Progress`. O status é checado antes de cada
   tentativa e, na espera, a cada `ANSWER_POLL_INTERVAL = 1h` (retry ilimitado,
