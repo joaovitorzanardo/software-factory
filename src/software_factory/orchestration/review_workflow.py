@@ -31,7 +31,8 @@ with workflow.unsafe.imports_passed_through():
     )
     from software_factory.orchestration.sessions import SessionWorkflow, failure_message
 
-# Rodadas seguidas (correção ou review que falhou) sem aprovação antes de perguntar no Linear.
+# Rodadas seguidas sem merge antes de perguntar no Linear: correção da review, review que falhou,
+# head vermelho antes da review e merge recusado por head_changed (alguém empurrou).
 MAX_REVIEW_ROUNDS = 3
 # Rótulo curto da pergunta de travamento nas clarificações (o comentário leva o texto inteiro).
 REVIEW_STUCK_QUESTION = (
@@ -158,6 +159,8 @@ class ReviewIssueWorkflow(SessionWorkflow):
             return ReviewResult(issue.identifier, OUTCOME_SKIPPED)
 
         rounds: list[ReviewRound] = []
+        # Rodadas que não terminaram em merge (ver MAX_REVIEW_ROUNDS); a resposta à pergunta de
+        # travamento zera.
         fix_rounds = 0
         follow_ups: list[str] = []
         # Follow-ups já criados, entre rodadas: a re-review que repete o achado reaproveita.
@@ -268,7 +271,9 @@ class ReviewIssueWorkflow(SessionWorkflow):
                     issue.identifier, OUTCOME_MERGED, pull.url, tuple(follow_ups)
                 )
             if merge.head_changed:
-                # Alguém empurrou depois da review: revisa o head novo.
+                # Alguém empurrou depois da review: revisa o head novo. Conta rodada, para um
+                # push contínuo não revisar sem fim.
+                fix_rounds += 1
                 continue
             question = (
                 f"A PR {pull.url} não pode ser mergeada: {merge.reason}. "

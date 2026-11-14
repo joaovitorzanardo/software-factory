@@ -529,6 +529,20 @@ class TestReviewIssueWorkflow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake.questions, [])
         self.assertEqual(fake.merge_requests[1].head_sha, "sha-2")
 
+    async def test_head_changed_every_time_hits_stuck_question(self) -> None:
+        fake = FakeReviewActivities(
+            merges=[MergeResult(False, head_changed=True)] * MAX_REVIEW_ROUNDS,
+            answers=["siga"],
+        )
+        result = await self.run_workflow(fake)
+        self.assertEqual(result.outcome, "merged")
+        self.assertEqual(len(fake.questions), 1)
+        self.assertIn(f"{MAX_REVIEW_ROUNDS} rodadas", fake.questions[0].body)
+        reviews = [i for i, c in enumerate(fake.calls) if c == "review_pull"]
+        self.assertEqual(len(reviews), MAX_REVIEW_ROUNDS + 1)
+        question_at = fake.calls.index("post_comment", reviews[MAX_REVIEW_ROUNDS - 1] + 2)
+        self.assertLess(question_at, reviews[MAX_REVIEW_ROUNDS])
+
     async def test_review_session_failure_counts_round_and_retries(self) -> None:
         fake = FakeReviewActivities(fail_review_times=1)
         result = await self.run_workflow(fake)
