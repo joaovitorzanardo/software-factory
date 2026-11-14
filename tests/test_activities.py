@@ -407,12 +407,13 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
             [
                 "git checkout -B factory/ENG-12",
                 "git add docs/superpowers/plans/ENG-12.md",
-                'git diff --cached --quiet || git -c user.name="software-factory"'
+                "git diff --cached --quiet || git -c core.hooksPath=/dev/null"
+                ' -c user.name="software-factory"'
                 ' -c user.email="software-factory@users.noreply.github.com"'
                 ' commit -m "docs: plano de implementação ENG-12"',
                 "git rev-parse HEAD",
                 "git ls-remote --heads origin refs/heads/factory/ENG-12",
-                "git push -u origin factory/ENG-12",
+                "git -c core.hooksPath=/dev/null push -u origin factory/ENG-12",
             ],
         )
         for run in FakeSandbox.instance.commands.runs:
@@ -422,14 +423,14 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
     async def test_commit_plan_idempotent_after_push(self) -> None:
         branch = await self.run_commit_plan(remote="abc123\trefs/heads/factory/ENG-12\n")
         self.assertEqual(branch, "factory/ENG-12")
-        self.assertFalse(any("git push" in cmd for cmd in self.commands()))
+        self.assertFalse(any(" push " in cmd for cmd in self.commands()))
 
     async def test_commit_plan_rejects_diverged_remote(self) -> None:
         with self.assertRaises(ApplicationError) as ctx:
             await self.run_commit_plan(remote="zzz999\trefs/heads/factory/ENG-12\n")
         self.assertTrue(ctx.exception.non_retryable)
         self.assertIn("factory/ENG-12", str(ctx.exception))
-        self.assertFalse(any("git push" in cmd for cmd in self.commands()))
+        self.assertFalse(any(" push " in cmd for cmd in self.commands()))
 
     async def test_commit_plan_missing_plan_file(self) -> None:
         with self.assertRaises(ApplicationError):
@@ -532,9 +533,9 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
             require_changes=False,
         )
         runs = FakeSandbox.instance.commands.runs
-        commit = next(r["cmd"] for r in runs if "git commit" in r["cmd"])
+        commit = next(r["cmd"] for r in runs if " commit " in r["cmd"])
         self.assertIn('-m "wip: tentativa 1 de ENG-12 (testes vermelhos)"', commit)
-        self.assertTrue(any("git push" in r["cmd"] for r in runs))
+        self.assertTrue(any(" push " in r["cmd"] for r in runs))
 
     async def test_commit_implementation_no_changes_allowed(self) -> None:
         result = await self.run_commit_implementation(
@@ -542,7 +543,7 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result, "factory/ENG-12")
         runs = FakeSandbox.instance.commands.runs
-        self.assertFalse(any("git push" in r["cmd"] for r in runs))
+        self.assertFalse(any(" push " in r["cmd"] for r in runs))
         self.assertFalse(any("ls-remote" in r["cmd"] for r in runs))
 
     async def test_commit_implementation_pushes(self) -> None:
@@ -552,10 +553,12 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(branch, "factory/ENG-12")
         runs = FakeSandbox.instance.commands.runs
         self.assertEqual(runs[0]["cmd"], "git add -A")
-        self.assertIn('git commit -m "feat: implementa ENG-12"', runs[1]["cmd"])
+        self.assertIn(
+            'git -c core.hooksPath=/dev/null commit -m "feat: implementa ENG-12"', runs[1]["cmd"]
+        )
         self.assertEqual(
             runs[-1]["cmd"],
-            'git push "https://x-access-token:$GITHUB_TOKEN@github.com/acme/app.git"'
+            'git -c core.hooksPath=/dev/null push "https://x-access-token:$GITHUB_TOKEN@github.com/acme/app.git"'
             " HEAD:refs/heads/factory/ENG-12",
         )
         self.assertEqual(runs[-1]["envs"], {"GITHUB_TOKEN": "gh-token"})
@@ -570,19 +573,19 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
             "def456\n", "def456\trefs/heads/factory/ENG-12\n"
         )
         self.assertEqual(branch, "factory/ENG-12")
-        self.assertFalse(any("git push" in cmd for cmd in self.commands()))
+        self.assertFalse(any(" push " in cmd for cmd in self.commands()))
 
     async def test_commit_implementation_rejects_no_changes(self) -> None:
         with self.assertRaises(ApplicationError) as ctx:
             await self.run_commit_implementation("abc123\n", "abc123\trefs/heads/factory/ENG-12\n")
         self.assertTrue(ctx.exception.non_retryable)
-        self.assertFalse(any("ls-remote" in cmd or "git push" in cmd for cmd in self.commands()))
+        self.assertFalse(any("ls-remote" in cmd or " push " in cmd for cmd in self.commands()))
 
     async def test_commit_implementation_rejects_moved_remote(self) -> None:
         with self.assertRaises(ApplicationError) as ctx:
             await self.run_commit_implementation("def456\n", "zzz999\trefs/heads/factory/ENG-12\n")
         self.assertTrue(ctx.exception.non_retryable)
-        self.assertFalse(any("git push" in cmd for cmd in self.commands()))
+        self.assertFalse(any(" push " in cmd for cmd in self.commands()))
 
     def claude_writes(self, files_to_write: dict[str, str]) -> None:
         files = FakeSandbox.instance.files

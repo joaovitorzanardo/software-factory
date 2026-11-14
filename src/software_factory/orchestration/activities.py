@@ -50,6 +50,9 @@ TEST_OUTPUT_TAIL = 4000
 HEARTBEAT_INTERVAL_S = 30
 GIT_COMMAND_TIMEOUT_S = 60
 CLONE_BRANCH_DEPTH = 50
+# commit/push com hooks desligados: hooks plantados em .git/hooks (o Claude teve Bash) não rodam
+# com o token no ambiente.
+GIT_NO_HOOKS = "git -c core.hooksPath=/dev/null"
 GIT_AUTHOR_NAME = "software-factory"
 GIT_AUTHOR_EMAIL = "software-factory@users.noreply.github.com"
 
@@ -334,8 +337,8 @@ class SandboxActivities:
         await git(f"git checkout -B {branch}")
         await git(f"git add {path}")
         await git(
-            f'git diff --cached --quiet || git -c user.name="{GIT_AUTHOR_NAME}"'
-            f' -c user.email="{GIT_AUTHOR_EMAIL}"'
+            f"git diff --cached --quiet || {GIT_NO_HOOKS}"
+            f' -c user.name="{GIT_AUTHOR_NAME}" -c user.email="{GIT_AUTHOR_EMAIL}"'
             f' commit -m "docs: plano de implementação {request.identifier}"'
         )
         local_sha = await git("git rev-parse HEAD")
@@ -347,7 +350,7 @@ class SandboxActivities:
             raise ApplicationError(
                 f"branch {branch} já existe no remoto com outro conteúdo", non_retryable=True
             )
-        await git(f"git push -u origin {branch}")
+        await git(f"{GIT_NO_HOOKS} push -u origin {branch}")
         return branch
 
     def _authed_url(self) -> str:
@@ -462,7 +465,7 @@ class SandboxActivities:
 
         message = request.message or f"feat: implementa {request.identifier}"
         await git("git add -A")
-        await git(f'git diff --cached --quiet || git commit -m "{message}"')
+        await git(f'git diff --cached --quiet || {GIT_NO_HOOKS} commit -m "{message}"')
         local_sha = await git("git rev-parse HEAD")
         if local_sha == request.base_sha:
             if request.require_changes:
@@ -478,7 +481,9 @@ class SandboxActivities:
             raise ApplicationError(
                 f"branch {branch} mudou no remoto desde o clone", non_retryable=True
             )
-        await git(f"git push {self._authed_url()} HEAD:refs/heads/{branch}", envs=token_env)
+        await git(
+            f"{GIT_NO_HOOKS} push {self._authed_url()} HEAD:refs/heads/{branch}", envs=token_env
+        )
         return branch
 
     @activity.defn
