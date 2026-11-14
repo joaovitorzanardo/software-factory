@@ -10,9 +10,13 @@ from temporalio.exceptions import ApplicationError
 
 from software_factory.config import FactorySettings
 from software_factory.orchestration.models import (
+    AnalyzeRequest,
     CloneBranchRequest,
+    Clarification,
     CommitImplementationRequest,
     CommitPlanRequest,
+    FixAnalysis,
+    FixRequest,
     ImplementRequest,
     PlanIssueInput,
     PlanRequest,
@@ -22,9 +26,16 @@ from software_factory.orchestration.models import (
 REPO_DIR = "/home/user/repo"
 PROMPT_PATH = "/home/user/prompt.md"
 IMPLEMENT_PROMPT_PATH = "/home/user/implement-prompt.md"
-# Skill writing-plans do superpowers 7.0.0, vendorizada (sem instalar plugin via rede).
-SKILL_SOURCE = Path(__file__).parent / "skills" / "writing-plans" / "SKILL.md"
-SKILL_DEST = "/home/user/.claude/skills/writing-plans/SKILL.md"
+ANALYZE_PROMPT_PATH = "/home/user/analyze-prompt.md"
+FIX_PROMPT_PATH = "/home/user/fix-prompt.md"
+# Arquivos da análise da falha, fora do repo (nunca commitados).
+FIX_DIR = "/home/user/fix"
+ANALYSIS_PATH = f"{FIX_DIR}/analysis.md"
+FIX_PLAN_PATH = f"{FIX_DIR}/plan.md"
+QUESTION_PATH = f"{FIX_DIR}/question.md"
+# Skills do superpowers (writing-plans, systematic-debugging) vendorizadas, sem instalar plugin via rede.
+SKILLS_SOURCE_DIR = Path(__file__).parent / "skills"
+SKILLS_DEST_DIR = "/home/user/.claude/skills"
 PLANS_DIR = "docs/superpowers/plans"
 # O identifier vai para caminho e comando shell: só o formato do Linear (ENG-12).
 IDENTIFIER_RE = re.compile(r"[A-Za-z0-9]+-[0-9]+")
@@ -34,6 +45,7 @@ PLAN_COMMAND_TIMEOUT_S = 40 * 60
 # Implementação + testes cabem na vida do sandbox junto com clone e commit.
 IMPLEMENT_COMMAND_TIMEOUT_S = 30 * 60
 TEST_COMMAND_TIMEOUT_S = 10 * 60
+ANALYZE_COMMAND_TIMEOUT_S = 25 * 60
 TEST_OUTPUT_TAIL = 4000
 HEARTBEAT_INTERVAL_S = 30
 GIT_COMMAND_TIMEOUT_S = 60
@@ -105,6 +117,108 @@ URL: {issue.url or "-"}
 
 {issue.description or "(sem descrição)"}
 """
+
+
+_NO_TEST_TAMPERING = (
+    "Proibido apagar, pular ou afrouxar testes (nada de `skip`, `xfail`, remover asserts) "
+    "e proibido mudar o `TEST_COMMAND`: a correção tem de estar no código, não nos testes."
+)
+
+
+def _fence(text: str) -> str:
+    # Cerca mais longa que qualquer sequência de crases da saída, para não fechar o bloco antes.
+    longest = max((len(m) for m in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}\n{text}\n{fence}"
+
+
+def _issue_section(issue: PlanIssueInput) -> str:
+    return f"""## Issue {issue.identifier}: {issue.title}
+
+URL: {issue.url or "-"}
+
+{issue.description or "(sem descrição)"}
+"""
+
+
+def _clarifications_section(clarifications: tuple[Clarification, ...]) -> str:
+    if not clarifications:
+        return ""
+    items = "\n\n".join(f"- Pergunta: {c.question}\n  Resposta: {c.answer}" for c in clarifications)
+    return f"## Decisões da pessoa\n\n{items}\n\n"
+
+
+def analyze_command() -> str:
+    return (
+        f"cat {ANALYZE_PROMPT_PATH} | claude -p --output-format stream-json --verbose"
+        ' --allowedTools "Read,Grep,Glob,Skill,Edit,Write,Bash"'
+    )
+
+
+def fix_command() -> str:
+    return (
+        f"cat {FIX_PROMPT_PATH} | claude -p --output-format stream-json --verbose"
+        ' --allowedTools "Read,Grep,Glob,Skill,Edit,Write,Bash"'
+    )
+
+
+def build_analyze_prompt(request: AnalyzeRequest, test_command: str) -> str:
+    issue = request.issue
+    attempts = ""
+    if request.attempts:
+        items = "\n\n".join(
+            f"### Tentativa #{a.number}\n\nAnálise:\n\n{a.analysis}\n\n"
+            f"Saída dos testes depois da correção:\n\n{_fence(a.test_output)}"
+            for a in request.attempts
+        )
+        attempts = f"## Tentativas anteriores\n\n{items}\n\n"
+    return f"""Os testes do repo falharam depois da implementação da issue abaixo. Ache a causa raiz e planeje a correção.
+
+1. Use a skill `systematic-debugging` para achar a **causa raiz** da falha, seguindo as fases de
+   investigação. Pode rodar `{test_command}` e qualquer outro comando. **Não corrija nada no
+   repo**: as mudanças feitas aqui são descartadas.
+2. Salve a análise (causa raiz, evidências e decisões tomadas) em `{ANALYSIS_PATH}`.
+3. Depois use a skill `writing-plans` para escrever o plano de correção em `{FIX_PLAN_PATH}`
+   (substitui o caminho padrão da skill). No campo **Spec:** do cabeçalho, use `{ANALYSIS_PATH}`
+   e a issue {issue.identifier}. Pule a seção "Execution Handoff".
+4. Decida sozinho e registre a decisão na análise. **Só** se a correção exigir uma decisão grande
+   (mudar o escopo ou os requisitos da issue, mudar a arquitetura do plano original
+   `{plan_path(issue.identifier)}`, mudar o comportamento esperado por testes existentes,
+   adicionar dependência, migração de dados), escreva em `{QUESTION_PATH}` a pergunta com as
+   opções e a sua recomendação, e **não** escreva o plano de correção.
+5. {_NO_TEST_TAMPERING} Nenhuma proposta de correção pode incluir isso.
+6. Não faça perguntas interativas; termine com um resumo.
+
+## Saída dos testes (`{test_command}`)
+
+{_fence(request.test_output)}
+
+{attempts}{_clarifications_section(request.clarifications)}{_issue_section(issue)}"""
+
+
+def build_fix_prompt(request: FixRequest, test_command: str) -> str:
+    return f"""Implemente a correção dos testes que falharam na issue abaixo, seguindo o plano em
+`{FIX_PLAN_PATH}` (a análise da causa raiz está em `{ANALYSIS_PATH}`).
+
+- Leia o plano e a análise inteiros e implemente as tarefas na ordem, com TDD (teste primeiro,
+  ver falhar, implementar, ver passar).
+- Os testes do repo rodam com `{test_command}`; rode até ficar verde antes de terminar.
+- Faça um commit local por tarefa concluída.
+- **Não** faça `git push` nem mexa em remotes; o push é feito depois, fora daqui.
+- {_NO_TEST_TAMPERING}
+- Respeite as decisões da pessoa listadas abaixo, se houver.
+- Não faça perguntas; termine com um resumo do que foi corrigido.
+
+{_clarifications_section(request.clarifications)}{_issue_section(request.issue)}"""
+
+
+async def install_skills(sandbox: Any) -> None:
+    """Copia as skills vendorizadas para ~/.claude/skills/ do sandbox."""
+    for source in sorted(SKILLS_SOURCE_DIR.rglob("*")):
+        if source.is_dir() or "__pycache__" in source.parts:
+            continue
+        relative = source.relative_to(SKILLS_SOURCE_DIR).as_posix()
+        await sandbox.files.write(f"{SKILLS_DEST_DIR}/{relative}", source.read_text())
 
 
 def parse_result(stdout: str) -> str:
@@ -185,7 +299,7 @@ class SandboxActivities:
     async def generate_plan(self, request: PlanRequest) -> str:
         path = plan_path(request.issue.identifier)
         sandbox = await self._connect(request.sandbox_id)
-        await sandbox.files.write(SKILL_DEST, SKILL_SOURCE.read_text())
+        await install_skills(sandbox)
         # Plano de uma tentativa anterior: o Write do Claude exigiria Read antes; recomeça limpo.
         if await sandbox.files.exists(f"{REPO_DIR}/{path}"):
             await sandbox.files.remove(f"{REPO_DIR}/{path}")
@@ -268,6 +382,50 @@ class SandboxActivities:
         result = await _run_with_heartbeat(
             sandbox, implement_command(), IMPLEMENT_COMMAND_TIMEOUT_S
         )
+        return parse_result(result.stdout)
+
+    @activity.defn
+    async def analyze_failure(self, request: AnalyzeRequest) -> FixAnalysis:
+        """Acha a causa raiz da falha e escreve o plano de correção (ou uma pergunta)."""
+        sandbox = await self._connect(request.sandbox_id)
+        await install_skills(sandbox)
+        # Retry e sessões novas não herdam arquivos velhos de análise.
+        await sandbox.commands.run(
+            f"rm -rf {FIX_DIR} && mkdir -p {FIX_DIR}", timeout=GIT_COMMAND_TIMEOUT_S
+        )
+        await sandbox.files.write(
+            ANALYZE_PROMPT_PATH, build_analyze_prompt(request, self.settings.test_command)
+        )
+        result = await _run_with_heartbeat(sandbox, analyze_command(), ANALYZE_COMMAND_TIMEOUT_S)
+        parse_result(result.stdout)
+
+        async def read_optional(path: str) -> str:
+            try:
+                return (await sandbox.files.read(path)).strip()
+            except FileNotFoundException:
+                return ""
+
+        analysis = await read_optional(ANALYSIS_PATH)
+        question = await read_optional(QUESTION_PATH)
+        if question:
+            return FixAnalysis(analysis=analysis, question=question)
+        plan = await read_optional(FIX_PLAN_PATH)
+        if not analysis or not plan:
+            raise ApplicationError(
+                f"Claude Code não salvou a análise em {ANALYSIS_PATH} e o plano em {FIX_PLAN_PATH}"
+            )
+        return FixAnalysis(analysis=analysis, plan=plan)
+
+    @activity.defn
+    async def implement_fix(self, request: FixRequest) -> str:
+        sandbox = await self._connect(request.sandbox_id)
+        await install_skills(sandbox)
+        await sandbox.files.write(ANALYSIS_PATH, request.analysis)
+        await sandbox.files.write(FIX_PLAN_PATH, request.plan)
+        await sandbox.files.write(
+            FIX_PROMPT_PATH, build_fix_prompt(request, self.settings.test_command)
+        )
+        result = await _run_with_heartbeat(sandbox, fix_command(), IMPLEMENT_COMMAND_TIMEOUT_S)
         return parse_result(result.stdout)
 
     @activity.defn

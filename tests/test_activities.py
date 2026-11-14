@@ -11,16 +11,29 @@ from temporalio.testing import ActivityEnvironment
 
 from software_factory.config import FactorySettings
 from software_factory.orchestration.activities import (
+    ANALYSIS_PATH,
+    FIX_DIR,
+    FIX_PLAN_PATH,
+    FIX_PROMPT_PATH,
+    QUESTION_PATH,
     REPO_DIR,
+    SKILLS_DEST_DIR,
     SandboxActivities,
+    build_analyze_prompt,
+    build_fix_prompt,
     build_implement_prompt,
     build_plan_prompt,
     plan_path,
 )
 from software_factory.orchestration.models import (
+    AnalyzeRequest,
     CloneBranchRequest,
+    Clarification,
     CommitImplementationRequest,
     CommitPlanRequest,
+    FixAnalysis,
+    FixAttempt,
+    FixRequest,
     ImplementRequest,
     PlanIssueInput,
     PlanRequest,
@@ -137,7 +150,7 @@ class FakeSandbox:
 
 
 PLAN_FILE = f"{REPO_DIR}/docs/superpowers/plans/ENG-12.md"
-SKILL_DEST = "/home/user/.claude/skills/writing-plans/SKILL.md"
+SKILL_DEST = f"{SKILLS_DEST_DIR}/writing-plans/SKILL.md"
 
 
 def stream(*events: dict[str, Any]) -> str:
@@ -211,6 +224,34 @@ class TestBuildImplementPrompt(unittest.TestCase):
     def test_missing_description(self) -> None:
         issue = PlanIssueInput("issue-1", "ENG-12", "Título", None, None)
         self.assertIn("sem descrição", build_implement_prompt(issue, "make test"))
+
+
+class TestFixPrompts(unittest.TestCase):
+    def test_analyze_prompt(self) -> None:
+        request = AnalyzeRequest(
+            "sbx-1", ISSUE, test_output="FAILED test_login",
+            attempts=(FixAttempt(1, "faltava hash", "FAILED test_hash"),),
+            clarifications=(Clarification("Usar bcrypt?", "Sim"),),
+        )
+        prompt = build_analyze_prompt(request, "python -m pytest")
+        for text in ("systematic-debugging", "writing-plans", ANALYSIS_PATH, FIX_PLAN_PATH,
+                     QUESTION_PATH, "FAILED test_login", "faltava hash", "FAILED test_hash",
+                     "Usar bcrypt?", "Sim", "python -m pytest", "docs/superpowers/plans/ENG-12.md"):
+            self.assertIn(text, prompt)
+        self.assertIn("apagar, pular ou afrouxar testes", prompt)
+
+    def test_analyze_prompt_omits_empty_sections(self) -> None:
+        prompt = build_analyze_prompt(AnalyzeRequest("sbx-1", ISSUE, "FAILED"), "make test")
+        self.assertNotIn("Tentativas anteriores", prompt)
+        self.assertNotIn("Decisões da pessoa", prompt)
+
+    def test_fix_prompt(self) -> None:
+        prompt = build_fix_prompt(
+            FixRequest("sbx-1", ISSUE, "análise", "plano",
+                       (Clarification("Usar bcrypt?", "Sim"),)), "python -m pytest")
+        for text in (FIX_PLAN_PATH, ANALYSIS_PATH, "python -m pytest", "git push",
+                     "Usar bcrypt?", "apagar, pular ou afrouxar testes"):
+            self.assertIn(text, prompt)
 
 
 class TestPlanPath(unittest.TestCase):
@@ -527,6 +568,56 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
             await self.run_commit_implementation("def456\n", "zzz999\trefs/heads/factory/ENG-12\n")
         self.assertTrue(ctx.exception.non_retryable)
         self.assertFalse(any("git push" in cmd for cmd in self.commands()))
+
+    def claude_writes(self, files_to_write: dict[str, str]) -> None:
+        files = FakeSandbox.instance.files
+
+        def on_run(cmd: str) -> None:
+            if "claude -p" in cmd:
+                files.written.update(files_to_write)
+
+        FakeSandbox.instance.commands.on_run = on_run
+        FakeSandbox.instance.commands.stdout = stream(
+            {"type": "result", "subtype": "success", "result": "<texto do result>"}
+        )
+
+    async def test_analyze_failure_returns_plan(self) -> None:
+        self.claude_writes({ANALYSIS_PATH: "causa", FIX_PLAN_PATH: "plano"})
+        result = await self.env.run(
+            self.activities.analyze_failure, AnalyzeRequest("sbx-1", ISSUE, "FAILED")
+        )
+        self.assertEqual(result, FixAnalysis(analysis="causa", plan="plano"))
+        files = FakeSandbox.instance.files.written
+        self.assertIn(f"{SKILLS_DEST_DIR}/systematic-debugging/SKILL.md", files)
+        self.assertIn(f"{SKILLS_DEST_DIR}/writing-plans/SKILL.md", files)
+        runs = FakeSandbox.instance.commands.runs
+        self.assertTrue(any(f"rm -rf {FIX_DIR}" in r["cmd"] for r in runs))
+        self.assertTrue(self.heartbeats)
+
+    async def test_analyze_failure_returns_question(self) -> None:
+        self.claude_writes({ANALYSIS_PATH: "causa", QUESTION_PATH: "Trocar o ORM?"})
+        result = await self.env.run(
+            self.activities.analyze_failure, AnalyzeRequest("sbx-1", ISSUE, "FAILED")
+        )
+        self.assertEqual(result, FixAnalysis(analysis="causa", question="Trocar o ORM?"))
+
+    async def test_analyze_failure_without_plan_or_question(self) -> None:
+        self.claude_writes({ANALYSIS_PATH: "causa"})
+        with self.assertRaises(ApplicationError):
+            await self.env.run(
+                self.activities.analyze_failure, AnalyzeRequest("sbx-1", ISSUE, "FAILED")
+            )
+
+    async def test_implement_fix_writes_plan_and_runs_claude(self) -> None:
+        self.claude_writes({})
+        result = await self.env.run(
+            self.activities.implement_fix, FixRequest("sbx-1", ISSUE, "causa", "plano")
+        )
+        files = FakeSandbox.instance.files.written
+        self.assertEqual(files[FIX_PLAN_PATH], "plano")
+        self.assertEqual(files[ANALYSIS_PATH], "causa")
+        self.assertIn(FIX_PROMPT_PATH, files)
+        self.assertEqual(result, "<texto do result>")
 
     async def test_kill_sandbox(self) -> None:
         await self.env.run(self.activities.kill_sandbox, "sbx-1")
