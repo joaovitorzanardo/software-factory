@@ -6,6 +6,7 @@ from typing import Any, Callable
 from unittest import mock
 
 from e2b import CommandExitException, FileNotFoundException
+from e2b.retry import resolve_idempotency_key
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
@@ -283,9 +284,23 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
         info = self.env.info
         self.assertEqual(
             call["idempotency_key"],
-            f"{info.workflow_id}:{info.workflow_run_id}:{info.activity_id}",
+            f"{info.workflow_id}-{info.workflow_run_id}-{info.activity_id}".lower(),
         )
         self.assertEqual(call["api_key"], "e2b-key")
+
+    async def test_create_sandbox_idempotency_key_accepted_by_e2b(self) -> None:
+        # IDs reais do Temporal: workflow id do webhook, run id UUID e activity id numérico.
+        info = replace(
+            self.env.info,
+            workflow_id="implement-issue-9b1D2c3e-AAAA",
+            workflow_run_id="0193A1B2-C3D4-7E5F-8091-A2B3C4D5E6F7",
+            activity_id="12",
+        )
+        env = ActivityEnvironment()
+        env.info = info
+        await env.run(self.activities.create_sandbox, "issue-1")
+        (call,) = FakeSandbox.create_calls
+        self.assertEqual(resolve_idempotency_key(call["idempotency_key"]), call["idempotency_key"])
 
     async def test_create_sandbox_with_oauth_token(self) -> None:
         settings = replace(SETTINGS, anthropic_api_key=None, claude_code_oauth_token="oat-token")

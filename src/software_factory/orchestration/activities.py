@@ -270,13 +270,16 @@ class SandboxActivities:
     @activity.defn
     async def create_sandbox(self, issue_id: str) -> str:
         # Mesma chave em retry da mesma activity (mesmo sandbox); sessão e execução novas têm outra.
+        # O E2B só aceita [a-z0-9-]: junta com hífen e troca o resto por hífen.
         info = activity.info()
+        key = f"{info.workflow_id}-{info.workflow_run_id}-{info.activity_id}".lower()
+        key = re.sub(r"[^a-z0-9-]", "-", key)
         sandbox = await self.sandbox_cls.create(
             template=self.settings.e2b_template,
             timeout=SANDBOX_TIMEOUT_S,
             envs=self.settings.claude_auth_env,
             metadata={"issue_id": issue_id},
-            idempotency_key=f"{info.workflow_id}:{info.workflow_run_id}:{info.activity_id}",
+            idempotency_key=key,
             api_key=self.settings.e2b_api_key,
         )
         activity.logger.info("sandbox criado: %s", sandbox.sandbox_id)
