@@ -366,7 +366,8 @@ class SandboxActivities:
             # Histórico recente para a análise ver o que mudou (sem token no origin, não dá
             # para aprofundar depois).
             await sandbox.commands.run(
-                f"git clone --depth {CLONE_BRANCH_DEPTH} --branch {branch} {self._authed_url()} {REPO_DIR}",
+                f"git clone --depth {CLONE_BRANCH_DEPTH} --branch {branch}"
+                f" {self._authed_url()} {REPO_DIR}",
                 envs={"GITHUB_TOKEN": self.settings.github_token},
                 timeout=5 * 60,
             )

@@ -49,6 +49,9 @@ class FakeActivities:
         wrong_answer_first: str | None = None,
         flaky_check: int | None = None,
         flaky_failures: int = 0,
+        fail_fix_times: int = 0,
+        fail_analysis_times: int = 0,
+        answer_on_poll: str | None = None,
     ) -> None:
         self.not_in_progress = not_in_progress
         self.no_plan = no_plan
@@ -66,6 +69,11 @@ class FakeActivities:
         # flaky_failures vezes antes de responder.
         self.flaky_check = flaky_check
         self.flaky_failures = flaky_failures
+        # Primeiras execuções de implement_fix / analyze_failure que falham (não retentável).
+        self.fail_fix_times = fail_fix_times
+        self.fail_analysis_times = fail_analysis_times
+        # Responde no primeiro poll da espera, com o id devolvido pelo post_comment.
+        self.answer_on_poll = answer_on_poll
         self.client: Client | None = None
         self.calls: list[str] = []
         self.moves: list[MoveIssueRequest] = []
@@ -86,6 +94,14 @@ class FakeActivities:
             return True
         if self.not_in_progress:
             return False
+        if self.answer_on_poll is not None and self.comments:
+            assert self.client is not None
+            handle = self.client.get_workflow_handle(activity.info().workflow_id)
+            await handle.signal(
+                ImplementIssueWorkflow.human_answer,
+                HumanAnswer(f"comment-{len(self.comments)}", "reply-1", self.answer_on_poll),
+            )
+            self.answer_on_poll = None
         if self.progress_checks + 1 == self.flaky_check and self.flaky_failures > 0:
             self.flaky_failures -= 1
             raise ApplicationError("Linear fora do ar")
@@ -121,6 +137,9 @@ class FakeActivities:
     async def analyze_failure(self, request: AnalyzeRequest) -> FixAnalysis:
         self.calls.append("analyze_failure")
         self.analyze_requests.append(request)
+        if self.fail_analysis_times > 0:
+            self.fail_analysis_times -= 1
+            raise ApplicationError("análise sem plano", non_retryable=True)
         if self.analyses:
             return self.analyses.pop(0)
         return FixAnalysis("causa", plan="plano")
@@ -129,6 +148,9 @@ class FakeActivities:
     async def implement_fix(self, request: FixRequest) -> str:
         self.calls.append("implement_fix")
         self.fix_requests.append(request)
+        if self.fail_fix_times > 0:
+            self.fail_fix_times -= 1
+            raise ApplicationError("claude estourou max turns", non_retryable=True)
         return "Corrigido."
 
     @activity.defn(name="post_comment")
@@ -350,7 +372,91 @@ class TestImplementIssueWorkflow(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Fiz 5 tentativas", fake.comments[0].body)
         self.assertEqual(fake.calls.count("implement_fix"), 6)
         self.assertEqual(
-            fake.analyze_requests[-1].clarifications[0].answer, "tente mockar o relógio"
+            fake.analyze_requests[-1].clarifications,
+            (
+                Clarification(
+                    "Fiz 5 tentativas de correção e os testes continuam vermelhos."
+                    " Como devo seguir?",
+                    "tente mockar o relógio",
+                ),
+            ),
+        )
+
+    async def test_failed_fix_session_feeds_the_loop(self) -> None:
+        fake = FakeActivities(red_runs=1, fail_fix_times=1)
+        result = await self.run_workflow(fake)
+        self.assertEqual(result, ImplementResult("ENG-12", "pr_opened", PR_URL))
+        self.assertEqual(fake.calls.count("implement_fix"), 2)
+        # A sessão que falhou não roda testes, mas ainda faz checkpoint do que mudou.
+        self.assertEqual(fake.calls.count("run_tests"), 2)
+        self.assertEqual(
+            [c.message for c in fake.commits],
+            [
+                "wip: tentativa 0 de ENG-12 (testes vermelhos)",
+                "wip: tentativa 1 de ENG-12 (correção falhou)",
+                "feat: implementa ENG-12",
+            ],
+        )
+        self.assertFalse(fake.commits[1].require_changes)
+        failed = "implement_fix falhou: claude estourou max turns"
+        self.assertEqual(fake.analyze_requests[1].test_output, failed)
+        self.assertEqual(fake.analyze_requests[1].attempts[0].test_output, failed)
+        self.assertEqual(fake.calls.count("create_sandbox"), fake.calls.count("kill_sandbox"))
+
+    async def test_failed_fix_checkpoint_failure_still_feeds_the_loop(self) -> None:
+        fake = FakeActivities(red_runs=1, fail_fix_times=1)
+        original_commit = fake.commit_implementation
+
+        @activity.defn(name="commit_implementation")
+        async def commit_implementation(request: CommitImplementationRequest) -> str:
+            if "correção falhou" in request.message:
+                fake.calls.append("commit_implementation")
+                raise ApplicationError("push falhou", non_retryable=True)
+            return await original_commit(request)
+
+        fake.commit_implementation = commit_implementation  # type: ignore[method-assign]
+        result = await self.run_workflow(fake)
+        self.assertEqual(result.outcome, "pr_opened")
+        self.assertEqual(fake.calls.count("create_sandbox"), fake.calls.count("kill_sandbox"))
+
+    async def test_failed_analysis_session_feeds_the_loop(self) -> None:
+        fake = FakeActivities(red_runs=1, fail_analysis_times=1)
+        result = await self.run_workflow(fake)
+        self.assertEqual(result, ImplementResult("ENG-12", "pr_opened", PR_URL))
+        self.assertEqual(fake.calls.count("analyze_failure"), 2)
+        self.assertEqual(fake.calls.count("implement_fix"), 1)
+        (attempt,) = fake.analyze_requests[1].attempts
+        self.assertEqual(attempt.number, 1)
+        self.assertEqual(attempt.analysis, "análise falhou: análise sem plano")
+        self.assertEqual(attempt.test_output, "FAILED test_a")
+        self.assertEqual(fake.analyze_requests[1].test_output, "FAILED test_a")
+        self.assertEqual(fake.calls.count("create_sandbox"), fake.calls.count("kill_sandbox"))
+
+    async def test_failed_analyses_count_toward_max_attempts(self) -> None:
+        fake = FakeActivities(red_runs=1, fail_analysis_times=5, answers=["siga"])
+        result = await self.run_workflow(fake)
+        self.assertEqual(result.outcome, "pr_opened")
+        self.assertEqual(len(fake.comments), 1)
+        self.assertIn("Fiz 5 tentativas", fake.comments[0].body)
+        self.assertNotIn("implement_fix", fake.calls[: fake.calls.index("post_comment")])
+
+    async def test_truncates_analysis_in_attempts(self) -> None:
+        fake = FakeActivities(red_runs=2, analyses=[FixAnalysis("x" * 5000, plan="plano")])
+        await self.run_workflow(fake)
+        self.assertEqual(len(fake.fix_requests[0].analysis), 5000)
+        self.assertEqual(len(fake.analyze_requests[1].attempts[0].analysis), 3000)
+
+    async def test_answer_to_returned_comment_id(self) -> None:
+        fake = FakeActivities(
+            red_runs=1,
+            answer_on_poll="Use bcrypt",
+            analyses=[FixAnalysis("causa", question="bcrypt ou argon2?")],
+        )
+        result = await self.run_workflow(fake)
+        self.assertEqual(result.outcome, "pr_opened")
+        self.assertEqual(
+            fake.analyze_requests[1].clarifications,
+            (Clarification("bcrypt ou argon2?", "Use bcrypt"),),
         )
 
     async def test_noop_fix_keeps_looping(self) -> None:

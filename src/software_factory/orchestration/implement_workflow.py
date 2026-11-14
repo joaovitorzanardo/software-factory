@@ -3,7 +3,7 @@ from datetime import timedelta
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ApplicationError
+from temporalio.exceptions import ActivityError, ApplicationError, CancelledError
 
 from software_factory.orchestration.workflow import MOVE_ISSUE_RETRY, MOVE_ISSUE_TIMEOUT
 
@@ -43,6 +43,19 @@ ANSWER_POLL_INTERVAL = timedelta(hours=1)
 # Checagem de status no loop e na espera: tentativas ilimitadas, para uma instabilidade do
 # Linear não derrubar dias de espera. ApplicationError não retentável ainda falha o workflow.
 STATUS_CHECK_RETRY = RetryPolicy(maximum_interval=timedelta(minutes=5))
+ANALYSIS_CAP = 3000
+# Rótulo curto da pergunta de travamento nas clarificações (o comentário leva o texto inteiro).
+STUCK_QUESTION = (
+    "Fiz {n} tentativas de correção e os testes continuam vermelhos. Como devo seguir?"
+)
+
+
+def failure_message(error: ActivityError) -> str:
+    """Mensagem da causa (ApplicationError, timeout...) de uma activity que falhou.
+    Cancelamento não vira tentativa: propaga."""
+    if isinstance(error.cause, CancelledError):
+        raise error
+    return str(error.cause or error)[:2000]
 
 
 def format_question(question: str) -> str:
@@ -59,7 +72,7 @@ def format_question(question: str) -> str:
 def stuck_question(n: int, last: FixAttempt, output: str) -> str:
     return (
         f"Fiz {n} tentativas de correção e os testes continuam vermelhos.\n\n"
-        f"**Última análise:**\n{last.analysis[:3000]}\n\n"
+        f"**Última análise:**\n{last.analysis[:ANALYSIS_CAP]}\n\n"
         f"**Saída dos testes:**\n```\n{output[-2000:]}\n```\n\n"
         "Como devo seguir?"
     )
@@ -136,11 +149,34 @@ class ImplementIssueWorkflow:
             retry_policy=RetryPolicy(maximum_attempts=5),
         )
 
+    async def _commit(
+        self,
+        sandbox_id: str,
+        issue: PlanIssueInput,
+        base_sha: str,
+        message: str,
+        require_changes: bool,
+    ) -> None:
+        await workflow.execute_activity(
+            "commit_implementation",
+            CommitImplementationRequest(
+                sandbox_id=sandbox_id,
+                identifier=issue.identifier,
+                base_sha=base_sha,
+                message=message,
+                require_changes=require_changes,
+            ),
+            start_to_close_timeout=timedelta(minutes=3),
+            retry_policy=RetryPolicy(maximum_attempts=3),
+            result_type=str,
+        )
+
     async def _implement_session(
         self, issue: PlanIssueInput, attempt: int, fix: FixAnalysis | None = None
     ) -> TestRunResult:
         """Implementa o plano (attempt 0) ou a correção, roda os testes e empurra o resultado:
-        commit final se verde, checkpoint `wip` se vermelho."""
+        commit final se verde, checkpoint `wip` se vermelho. Falha da sessão de correção vira
+        resultado vermelho (alimenta o loop); a da implementação inicial falha o workflow."""
         sandbox_id = await self._create_sandbox(issue)
         try:
             base_sha = await self._clone_branch(sandbox_id, issue)
@@ -157,20 +193,41 @@ class ImplementIssueWorkflow:
                     result_type=str,
                 )
             else:
-                await workflow.execute_activity(
-                    "implement_fix",
-                    FixRequest(
-                        sandbox_id=sandbox_id,
-                        issue=issue,
-                        analysis=fix.analysis,
-                        plan=fix.plan or "",
-                        clarifications=tuple(self._clarifications),
-                    ),
-                    start_to_close_timeout=timedelta(minutes=35),
-                    heartbeat_timeout=timedelta(minutes=2),
-                    retry_policy=RetryPolicy(maximum_attempts=1),
-                    result_type=str,
-                )
+                try:
+                    await workflow.execute_activity(
+                        "implement_fix",
+                        FixRequest(
+                            sandbox_id=sandbox_id,
+                            issue=issue,
+                            analysis=fix.analysis,
+                            plan=fix.plan or "",
+                            clarifications=tuple(self._clarifications),
+                        ),
+                        start_to_close_timeout=timedelta(minutes=35),
+                        heartbeat_timeout=timedelta(minutes=2),
+                        retry_policy=RetryPolicy(maximum_attempts=1),
+                        result_type=str,
+                    )
+                except ActivityError as error:
+                    failed = TestRunResult(
+                        passed=False, output=f"implement_fix falhou: {failure_message(error)}"
+                    )
+                    # Melhor esforço: guarda o que a sessão chegou a mudar; sem isso, segue.
+                    try:
+                        await self._commit(
+                            sandbox_id,
+                            issue,
+                            base_sha,
+                            f"wip: tentativa {attempt} de {issue.identifier} (correção falhou)",
+                            require_changes=False,
+                        )
+                    except ActivityError as commit_error:
+                        workflow.logger.warning(
+                            "%s: checkpoint da correção que falhou não foi empurrado: %s",
+                            issue.identifier,
+                            failure_message(commit_error),
+                        )
+                    return failed
             tests: TestRunResult = await workflow.execute_activity(
                 "run_tests",
                 sandbox_id,
@@ -183,20 +240,14 @@ class ImplementIssueWorkflow:
                 message = f"feat: implementa {issue.identifier}"
             else:
                 message = f"wip: tentativa {attempt} de {issue.identifier} (testes vermelhos)"
-            await workflow.execute_activity(
-                "commit_implementation",
-                CommitImplementationRequest(
-                    sandbox_id=sandbox_id,
-                    identifier=issue.identifier,
-                    base_sha=base_sha,
-                    message=message,
-                    # Exige mudança só no verde direto sobre o plano: depois de um checkpoint,
-                    # uma correção sem mudança ainda vale.
-                    require_changes=tests.passed and base_sha == self._plan_sha,
-                ),
-                start_to_close_timeout=timedelta(minutes=3),
-                retry_policy=RetryPolicy(maximum_attempts=3),
-                result_type=str,
+            await self._commit(
+                sandbox_id,
+                issue,
+                base_sha,
+                message,
+                # Exige mudança só no verde direto sobre o plano: depois de um checkpoint,
+                # uma correção sem mudança ainda vale.
+                require_changes=tests.passed and base_sha == self._plan_sha,
             )
             return tests
         finally:
@@ -204,40 +255,49 @@ class ImplementIssueWorkflow:
 
     async def _analysis_session(
         self, issue: PlanIssueInput, test_output: str, attempts: list[FixAttempt]
-    ) -> FixAnalysis:
+    ) -> FixAnalysis | str:
+        """Análise da falha; se a sessão do Claude falhar, devolve a mensagem (str) para o loop
+        seguir. Falhas de sandbox/clone ainda falham o workflow."""
         sandbox_id = await self._create_sandbox(issue)
         try:
             await self._clone_branch(sandbox_id, issue)
-            return await workflow.execute_activity(
-                "analyze_failure",
-                AnalyzeRequest(
-                    sandbox_id=sandbox_id,
-                    issue=issue,
-                    test_output=test_output,
-                    attempts=tuple(attempts),
-                    clarifications=tuple(self._clarifications),
-                ),
-                start_to_close_timeout=timedelta(minutes=30),
-                heartbeat_timeout=timedelta(minutes=2),
-                retry_policy=RetryPolicy(maximum_attempts=1),
-                result_type=FixAnalysis,
-            )
+            try:
+                return await workflow.execute_activity(
+                    "analyze_failure",
+                    AnalyzeRequest(
+                        sandbox_id=sandbox_id,
+                        issue=issue,
+                        test_output=test_output,
+                        attempts=tuple(attempts),
+                        clarifications=tuple(self._clarifications),
+                    ),
+                    start_to_close_timeout=timedelta(minutes=30),
+                    heartbeat_timeout=timedelta(minutes=2),
+                    retry_policy=RetryPolicy(maximum_attempts=1),
+                    result_type=FixAnalysis,
+                )
+            except ActivityError as error:
+                return f"análise falhou: {failure_message(error)}"
         finally:
             await self._kill_sandbox(sandbox_id)
 
-    async def _ask(self, issue: PlanIssueInput, question: str) -> bool:
-        """Pergunta no Linear e espera o reply na thread. False = issue saiu de In Progress."""
+    async def _ask(self, issue: PlanIssueInput, question: str, label: str | None = None) -> bool:
+        """Pergunta no Linear e espera o reply na thread. False = issue saiu de In Progress.
+        `label` (padrão: a própria pergunta) é o que fica nas clarificações dos prompts."""
         comment_id = str(workflow.uuid4())
         # Antes do post: um reply rápido já encontra a pergunta pendente.
         self._pending_question = comment_id
         self._answer = None
-        await workflow.execute_activity(
+        posted_id: str = await workflow.execute_activity(
             "post_comment",
             CommentRequest(issue.issue_id, comment_id, format_question(question)),
             start_to_close_timeout=timedelta(seconds=30),
             retry_policy=RetryPolicy(maximum_attempts=5),
             result_type=str,
         )
+        # O id que vale é o do Linear; um reply que já chegou pelo id gerado não se perde.
+        if posted_id and posted_id != comment_id:
+            self._pending_question = posted_id
         deadline = workflow.now() + HUMAN_ANSWER_TIMEOUT
         while self._answer is None:
             remaining = deadline - workflow.now()
@@ -255,7 +315,7 @@ class ImplementIssueWorkflow:
                 if not await self._still_in_progress(issue):
                     self._pending_question = None
                     return False
-        self._clarifications.append(Clarification(question, self._answer))
+        self._clarifications.append(Clarification(label or question, self._answer))
         self._pending_question = None
         return True
 
@@ -301,20 +361,29 @@ class ImplementIssueWorkflow:
                 )
                 return ImplementResult(issue.identifier, OUTCOME_STOPPED)
             if len(attempts) - round_start >= MAX_FIX_ATTEMPTS:
-                question = stuck_question(len(attempts) - round_start, attempts[-1], tests.output)
-                if not await self._ask(issue, question):
+                n = len(attempts) - round_start
+                question = stuck_question(n, attempts[-1], tests.output)
+                if not await self._ask(issue, question, label=STUCK_QUESTION.format(n=n)):
                     return ImplementResult(issue.identifier, OUTCOME_STOPPED)
                 round_start = len(attempts)
             analysis = await self._analysis_session(
                 issue, tests.output, attempts[-ATTEMPTS_IN_PROMPT:]
             )
+            if isinstance(analysis, str):
+                # Sessão de análise falhou: conta tentativa (trava de custo) e reanalisa.
+                attempts.append(
+                    FixAttempt(len(attempts) + 1, analysis[:ANALYSIS_CAP], tests.output)
+                )
+                continue
             if analysis.question:
                 if not await self._ask(issue, analysis.question):
                     return ImplementResult(issue.identifier, OUTCOME_STOPPED)
                 # Reanalisa com a resposta; pergunta não conta tentativa.
                 continue
             tests = await self._implement_session(issue, attempt=len(attempts) + 1, fix=analysis)
-            attempts.append(FixAttempt(len(attempts) + 1, analysis.analysis, tests.output))
+            attempts.append(
+                FixAttempt(len(attempts) + 1, analysis.analysis[:ANALYSIS_CAP], tests.output)
+            )
 
         # Verde: o commit final já foi empurrado pela última sessão.
         pr_url: str = await workflow.execute_activity(
