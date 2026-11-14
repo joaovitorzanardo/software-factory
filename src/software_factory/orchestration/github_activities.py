@@ -1,8 +1,14 @@
 from temporalio import activity
+from temporalio.exceptions import ApplicationError
 
 from software_factory.github.client import GitHubClient
 from software_factory.orchestration.activities import plan_branch, plan_path
-from software_factory.orchestration.models import PullRequestRequest
+from software_factory.orchestration.models import (
+    MergeRequest,
+    MergeResult,
+    PullInfo,
+    PullRequestRequest,
+)
 
 
 def pull_request_body(request: PullRequestRequest) -> str:
@@ -32,8 +38,9 @@ class GitHubActivities:
         head = plan_branch(request.identifier)
         existing = await self.client.find_open_pull(head)
         if existing:
-            activity.logger.info("PR já aberta para %s: %s", head, existing)
-            return existing
+            url = existing["html_url"]
+            activity.logger.info("PR já aberta para %s: %s", head, url)
+            return url
         url = await self.client.create_pull(
             title=f"{request.identifier}: {request.title}",
             head=head,
@@ -42,3 +49,45 @@ class GitHubActivities:
         )
         activity.logger.info("PR aberta: %s", url)
         return url
+
+    @activity.defn
+    async def pull_request_info(self, identifier: str) -> PullInfo | None:
+        """PR aberta de factory/<ID> com o merge-base contra a base, ou None."""
+        pull = await self.client.find_open_pull(plan_branch(identifier))
+        if pull is None:
+            return None
+        head_sha = pull["head"]["sha"]
+        base_ref = pull["base"]["ref"]
+        return PullInfo(
+            number=pull["number"],
+            url=pull["html_url"],
+            head_sha=head_sha,
+            base_ref=base_ref,
+            base_sha=await self.client.merge_base(base_ref, head_sha),
+        )
+
+    @activity.defn
+    async def merge_pull_request(self, request: MergeRequest) -> MergeResult:
+        """Squash merge da PR no sha revisado; idempotente (PR já mergeada → sucesso)."""
+        pull = await self.client.get_pull(request.number)
+        if pull.get("merged"):
+            return MergeResult(True)
+        if pull.get("state") == "closed":
+            return MergeResult(False, reason="PR fechada sem merge")
+        if pull["head"]["sha"] != request.head_sha:
+            return MergeResult(False, head_changed=True)
+        mergeable = pull.get("mergeable")
+        if mergeable is None:
+            # O GitHub ainda calcula a mergeabilidade: o retry resolve.
+            raise ApplicationError("mergeable ainda não calculado pelo GitHub")
+        if mergeable is False:
+            return MergeResult(False, reason=f"não mergeável ({pull.get('mergeable_state')})")
+        title = f"{request.identifier}: {request.title} (#{request.number})"
+        merged, message = await self.client.merge_pull(request.number, request.head_sha, title)
+        if merged:
+            return MergeResult(True)
+        # 409 = head mudou entre o get_pull e o merge; 405 = recusa por outro motivo.
+        current = await self.client.get_pull(request.number)
+        if current["head"]["sha"] != request.head_sha:
+            return MergeResult(False, head_changed=True)
+        return MergeResult(False, reason=message)

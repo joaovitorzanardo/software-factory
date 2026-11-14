@@ -5,6 +5,7 @@ STATE_TODO = "To Do"
 STATE_IN_PLANNING = "In Planning"
 STATE_IN_PROGRESS = "In Progress"
 STATE_IN_REVIEW = "In Review"
+STATE_DONE = "Done"
 
 
 @dataclass(frozen=True)
@@ -144,6 +145,8 @@ OUTCOME_PR_OPENED = "pr_opened"
 OUTCOME_NO_PLAN = "no_plan"
 OUTCOME_SKIPPED = "skipped"
 OUTCOME_STOPPED = "stopped"
+OUTCOME_MERGED = "merged"
+OUTCOME_NO_PR = "no_pr"
 
 
 @dataclass(frozen=True)
@@ -151,3 +154,102 @@ class ImplementResult:
     identifier: str
     outcome: str
     pr_url: str | None = None
+
+
+REVIEW_DECISIONS = ("fix", "issue", "note", "reject", "ask")
+REVIEW_SEVERITIES = ("critical", "important", "minor")
+REVIEW_LENSES = ("correctness", "security")
+
+
+@dataclass(frozen=True)
+class PullInfo:
+    number: int
+    url: str
+    head_sha: str
+    base_ref: str
+    # Merge-base entre base_ref e head (compare API).
+    base_sha: str
+
+
+@dataclass(frozen=True)
+class ReviewFinding:
+    lens: str
+    severity: str
+    file: str
+    line: int | None
+    title: str
+    detail: str
+    decision: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class ReviewRound:
+    number: int
+    summary: str
+    findings: tuple[ReviewFinding, ...] = ()
+    # Resumo da sessão de correção (o que corrigiu e o que não, e por quê).
+    fix_notes: str = ""
+
+
+@dataclass(frozen=True)
+class ReviewRequest:
+    sandbox_id: str
+    issue: PlanIssueInput
+    base_sha: str
+    history: tuple[ReviewRound, ...] = ()
+    clarifications: tuple[Clarification, ...] = ()
+
+
+@dataclass(frozen=True)
+class ReviewReport:
+    summary: str
+    findings: tuple[ReviewFinding, ...]
+
+
+@dataclass(frozen=True)
+class ReviewFixRequest:
+    sandbox_id: str
+    issue: PlanIssueInput
+    round: int
+    findings: tuple[ReviewFinding, ...]
+    clarifications: tuple[Clarification, ...] = ()
+
+
+@dataclass(frozen=True)
+class MergeRequest:
+    identifier: str
+    title: str
+    number: int
+    head_sha: str
+
+
+@dataclass(frozen=True)
+class MergeResult:
+    merged: bool
+    head_changed: bool = False
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class CreateIssueRequest:
+    origin_issue_id: str
+    # UUID v4 gerado pelo workflow.
+    new_issue_id: str
+    title: str
+    description: str
+
+
+@dataclass(frozen=True)
+class FollowUpIssue:
+    identifier: str
+    url: str
+
+
+@dataclass(frozen=True)
+class ReviewResult:
+    identifier: str
+    outcome: str
+    pr_url: str | None = None
+    # Identifiers das issues criadas.
+    follow_ups: tuple[str, ...] = ()

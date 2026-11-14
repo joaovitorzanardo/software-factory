@@ -32,14 +32,18 @@ class GitHubClient:
             return await http.request(method, path, headers=headers, **kwargs)
 
     @staticmethod
+    def _message(response: httpx.Response) -> str | None:
+        try:
+            body = response.json()
+        except ValueError:
+            return None
+        return body.get("message") if isinstance(body, dict) else None
+
+    @staticmethod
     def _check(response: httpx.Response) -> httpx.Response:
         if response.is_success:
             return response
-        try:
-            body = response.json()
-            message = body.get("message") if isinstance(body, dict) else None
-        except ValueError:
-            message = None
+        message = GitHubClient._message(response)
         detail = f"HTTP {response.status_code}" + (f": {message}" if message else "")
         status = response.status_code
         rate_limited = status == 403 and response.headers.get("x-ratelimit-remaining") == "0"
@@ -67,7 +71,7 @@ class GitHubClient:
             return None
         return self._check(response).text
 
-    async def find_open_pull(self, head: str) -> str | None:
+    async def find_open_pull(self, head: str) -> dict[str, Any] | None:
         owner = self.repo.split("/")[0]
         response = await self._request(
             "GET",
@@ -75,7 +79,26 @@ class GitHubClient:
             params={"head": f"{owner}:{head}", "state": "open"},
         )
         pulls = response.json()
-        return pulls[0]["html_url"] if pulls else None
+        return pulls[0] if pulls else None
+
+    async def get_pull(self, number: int) -> dict[str, Any]:
+        return (await self._request("GET", f"/repos/{self.repo}/pulls/{number}")).json()
+
+    async def merge_base(self, base: str, head: str) -> str:
+        response = await self._request("GET", f"/repos/{self.repo}/compare/{base}...{head}")
+        return response.json()["merge_base_commit"]["sha"]
+
+    async def merge_pull(self, number: int, sha: str, title: str) -> tuple[bool, str]:
+        """Squash merge exigindo que o head seja `sha`. 405/409 → (False, mensagem do GitHub)."""
+        response = await self._send(
+            "PUT",
+            f"/repos/{self.repo}/pulls/{number}/merge",
+            json={"merge_method": "squash", "sha": sha, "commit_title": title},
+        )
+        if response.status_code in (405, 409):
+            return False, self._message(response) or f"HTTP {response.status_code}"
+        self._check(response)
+        return True, ""
 
     async def create_pull(self, title: str, head: str, base: str, body: str) -> str:
         response = await self._request(
