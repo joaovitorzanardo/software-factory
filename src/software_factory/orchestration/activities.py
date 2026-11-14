@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from e2b import AsyncSandbox, CommandExitException, FileNotFoundException
+from e2b import AsyncSandbox, CommandExitException, FileNotFoundException, TimeoutException
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
@@ -448,6 +448,15 @@ class SandboxActivities:
         except CommandExitException as error:
             output = (error.stdout or "") + (error.stderr or "")
             return TestRunResult(passed=False, output=output[-TEST_OUTPUT_TAIL:])
+        except TimeoutException as error:
+            # Timeout é vermelho, não falha: alimenta o loop de correção (teste travado/lento).
+            return TestRunResult(
+                passed=False,
+                output=(
+                    f"TEST_COMMAND estourou o timeout de {TEST_COMMAND_TIMEOUT_S // 60} min"
+                    f" ({error}); algum teste travou ou ficou lento demais."
+                ),
+            )
         output = (result.stdout or "") + (getattr(result, "stderr", "") or "")
         return TestRunResult(passed=True, output=output[-TEST_OUTPUT_TAIL:])
 

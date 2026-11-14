@@ -5,7 +5,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 from unittest import mock
 
-from e2b import CommandExitException, FileNotFoundException
+from e2b import CommandExitException, FileNotFoundException, TimeoutException
 from e2b.retry import resolve_idempotency_key
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
@@ -515,6 +515,15 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.passed)
         self.assertEqual(len(result.output), 4000)
         self.assertTrue(result.output.endswith("FAILED test_a"))
+
+    async def test_run_tests_timeout_is_red(self) -> None:
+        def time_out(cmd: str) -> None:
+            raise TimeoutException("context deadline exceeded")
+
+        FakeSandbox.instance.commands.on_run = time_out
+        result = await self.env.run(self.activities.run_tests, "sbx-1")
+        self.assertFalse(result.passed)
+        self.assertIn("TEST_COMMAND estourou o timeout de 10 min", result.output)
 
     async def run_commit_implementation(self, head: str, remote: str, **kwargs: Any) -> str:
         FakeSandbox.instance.commands.responses = {"rev-parse": head, "ls-remote": remote}
