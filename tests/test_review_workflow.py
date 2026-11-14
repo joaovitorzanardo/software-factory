@@ -71,7 +71,7 @@ class FakeReviewActivities:
         self,
         reports: list[ReviewReport] | None = None,
         merges: list[MergeResult] | None = None,
-        red_runs: int = 0,
+        red_test_runs: tuple[int, ...] = (),
         answers: list[str] | None = None,
         stop_after_checks: int | None = None,
         pull_missing: bool = False,
@@ -85,7 +85,8 @@ class FakeReviewActivities:
         # Relatório de cada rodada; esgotados, a review aprova.
         self.reports = list(reports or [])
         self.merges = list(merges or [])
-        self.red_runs = red_runs
+        # Execuções de run_tests (1, 2, ...) que dão vermelho; as demais dão verde.
+        self.red_test_runs = red_test_runs
         self.answers = list(answers or [])
         # Checagens de In Review depois da inicial que voltam True antes de voltar False.
         self.stop_after_checks = stop_after_checks
@@ -196,7 +197,9 @@ class FakeReviewActivities:
     async def run_tests(self, sandbox_id: str) -> TestRunResult:
         self.calls.append("run_tests")
         self.test_runs += 1
-        return TestRunResult(passed=self.test_runs > self.red_runs, output="FAILED test_a")
+        return TestRunResult(
+            passed=self.test_runs not in self.red_test_runs, output="FAILED test_a"
+        )
 
     @activity.defn(name="commit_implementation")
     async def commit_implementation(self, request: CommitImplementationRequest) -> str:
@@ -257,6 +260,7 @@ class TestReviewIssueWorkflow(unittest.IsolatedAsyncioTestCase):
                 "pull_request_info",
                 "create_sandbox",
                 "clone_branch",
+                "run_tests",
                 "review_pull",
                 "kill_sandbox",
                 "post_comment",
@@ -292,7 +296,8 @@ class TestReviewIssueWorkflow(unittest.IsolatedAsyncioTestCase):
 
     async def test_red_tests_after_review_fix_enter_fix_loop(self) -> None:
         fake = FakeReviewActivities(
-            reports=[ReviewReport("Um bug.", (finding("fix", "bug"),))], red_runs=1
+            # 1: antes da review (verde); 2: depois da correção da review (vermelho).
+            reports=[ReviewReport("Um bug.", (finding("fix", "bug"),))], red_test_runs=(2,)
         )
         result = await self.run_workflow(fake)
         self.assertEqual(result.outcome, "merged")
@@ -302,6 +307,31 @@ class TestReviewIssueWorkflow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             fake.commits[0].message, "wip: review 1 de ENG-12 (testes vermelhos)"
         )
+
+    async def test_red_head_is_fixed_before_review_and_merge(self) -> None:
+        fake = FakeReviewActivities(red_test_runs=(1,))
+        result = await self.run_workflow(fake)
+        self.assertEqual(result.outcome, "merged")
+        reviews = [i for i, c in enumerate(fake.calls) if c == "review_pull"]
+        self.assertEqual(len(reviews), 1)
+        self.assertLess(fake.calls.index("run_tests"), fake.calls.index("analyze_failure"))
+        self.assertLess(fake.calls.index("analyze_failure"), reviews[0])
+        self.assertLess(fake.calls.index("implement_fix"), reviews[0])
+        # A sessão vermelha não chega à review: testes, kill e o loop de correção.
+        first_tests = fake.calls.index("run_tests")
+        self.assertEqual(fake.calls[first_tests + 1], "kill_sandbox")
+        history = fake.review_requests[0].history
+        self.assertEqual(len(history), 1)
+        self.assertIn("testes vermelhos", history[0].summary)
+        # sha-1 vermelho, sha-2 análise, sha-3 correção: o merge é do sha-4, revisado e verde.
+        self.assertEqual(fake.merge_requests, [MergeRequest("ENG-12", ISSUE.title, 7, "sha-4")])
+
+    async def test_red_head_never_merges_when_stopped(self) -> None:
+        fake = FakeReviewActivities(red_test_runs=(1, 2, 3), stop_after_checks=1)
+        result = await self.run_workflow(fake)
+        self.assertEqual(result.outcome, "stopped")
+        self.assertNotIn("review_pull", fake.calls)
+        self.assertNotIn("merge_pull_request", fake.calls)
 
     async def test_issue_findings_create_follow_up_issues_once(self) -> None:
         fake = FakeReviewActivities(

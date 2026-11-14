@@ -39,6 +39,8 @@ REVIEW_STUCK_QUESTION = (
 )
 # Título da issue de follow-up (o título do achado vem do LLM, sem limite).
 FOLLOW_UP_TITLE_CAP = 200
+# Resumo da rodada em que o head clonado estava vermelho e nem foi revisado.
+RED_BEFORE_REVIEW = "testes vermelhos antes da review; corrigidos no loop de correção"
 QUICK_CALL_TIMEOUT = timedelta(seconds=30)
 QUICK_CALL_RETRY = RetryPolicy(maximum_attempts=5)
 # mergeable=None (GitHub ainda calculando) vira erro retentável: espera entre tentativas.
@@ -184,6 +186,15 @@ class ReviewIssueWorkflow(SessionWorkflow):
 
             number = len(rounds) + 1
             reviewed = await self._review_session(issue, pull, rounds)
+            if isinstance(reviewed, TestRunResult):
+                # Head vermelho (checkpoint wip, push humano...): corrige antes de revisar; a
+                # review e o merge só acontecem sobre um sha com TEST_COMMAND verde.
+                rounds.append(ReviewRound(number, RED_BEFORE_REVIEW))
+                fix_rounds += 1
+                green = await self._fix_until_green(issue, reviewed, STATE_IN_REVIEW)
+                if green is None:
+                    return self._stopped(issue, follow_ups)
+                continue
             if isinstance(reviewed, str):
                 # Sessão de review falhou: conta rodada (trava de custo) e revisa de novo.
                 rounds.append(ReviewRound(number, f"review falhou: {reviewed}"))
@@ -302,12 +313,23 @@ class ReviewIssueWorkflow(SessionWorkflow):
 
     async def _review_session(
         self, issue: PlanIssueInput, pull: PullInfo, rounds: list[ReviewRound]
-    ) -> tuple[ReviewReport, str] | str:
-        """Review da PR no head clonado; devolve o relatório e o sha revisado, ou a mensagem de
-        falha da sessão do Claude. Falhas de sandbox/clone ainda falham o workflow."""
+    ) -> tuple[ReviewReport, str] | str | TestRunResult:
+        """Roda TEST_COMMAND no head clonado e, se verde, faz a review da PR; devolve o relatório
+        e o sha revisado, o TestRunResult vermelho (sem review) ou a mensagem de falha da sessão
+        do Claude. Falhas de sandbox/clone/testes ainda falham o workflow."""
         sandbox_id = await self._create_sandbox(issue)
         try:
             reviewed_sha = await self._clone_branch(sandbox_id, issue)
+            tests: TestRunResult = await workflow.execute_activity(
+                "run_tests",
+                sandbox_id,
+                start_to_close_timeout=timedelta(minutes=12),
+                heartbeat_timeout=timedelta(minutes=2),
+                retry_policy=RetryPolicy(maximum_attempts=1),
+                result_type=TestRunResult,
+            )
+            if not tests.passed:
+                return tests
             try:
                 report: ReviewReport = await workflow.execute_activity(
                     "review_pull",
