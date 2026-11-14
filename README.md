@@ -15,8 +15,10 @@ O caminho completo que queremos automatizar é:
 Hoje (fase de teste) a fábrica faz as quatro etapas: ela recebe a issue, escreve o plano e salva
 esse plano numa branch do repositório; quando a issue entra em `In Progress`, implementa o plano,
 roda os testes e, se ficarem vermelhos, entra num loop de análise e correção até ficarem verdes;
-só então abre o PR e move a issue para `In Review`. Dúvidas grandes viram comentário na issue, e a
-resposta é um reply nesse comentário.
+só então abre o PR e move a issue para `In Review`. Em `In Review`, revisa a PR, corrige o que a
+review apontar e, aprovada, faz o merge **sem humano** (salvo arquivos sensíveis, que pedem
+confirmação) e move a issue para `Done`. Dúvidas grandes viram comentário na issue, e a resposta é
+um reply nesse comentário.
 
 Quem faz o trabalho "inteligente" é o **Claude Code**, rodando dentro de uma máquina isolada e
 descartável (sandbox do **E2B**). Quem coordena os passos, tenta de novo quando algo falha e
@@ -168,18 +170,28 @@ Qualquer outra falha (sandbox, clone, push, a implementação inicial) deixa a i
 Quando a issue entra em `In Review` (movida pelo `ImplementIssueWorkflow` ou por uma pessoa), o
 `ReviewIssueWorkflow` (id `review-issue-<issue id>`) revisa a PR `factory/<IDENTIFIER>`:
 
-1. cria um sandbox e roda, **em paralelo**, duas lentes só de leitura sobre o diff inteiro da PR:
+1. cria um sandbox e roda primeiro o `TEST_COMMAND` no head clonado; vermelho (checkpoint `wip`,
+   push de uma pessoa...) entra no loop de correção, conta rodada e a review recomeça, então nada
+   vermelho é revisado nem mergeado;
+2. com os testes verdes, roda **em paralelo** duas lentes só de leitura sobre o diff inteiro da PR:
    `correctness` (skill `requesting-code-review`) e `security`; depois uma triagem com a skill
    `receiving-code-review`, que decide cada achado: `fix`, `issue`, `note`, `reject` ou `ask`;
-2. achado `minor` nunca vira `fix` (só `note`, `issue` ou `reject`), então o loop converge;
-3. `issue` cria uma issue de follow-up no Linear **sem** label de gatilho (a pessoa adiciona
+3. achado `minor` nunca vira `fix` (só `note`, `issue` ou `reject`), então o loop converge;
+4. `issue` cria uma issue de follow-up no Linear **sem** label de gatilho (a pessoa adiciona
    `Feature`/`Bug` se quiser que a fábrica pegue), sem repetir a mesma issue entre rodadas;
-4. cada rodada posta um comentário de resumo na issue;
-5. com `fix`, uma sessão de correção roda os testes, faz push e começa nova rodada;
-6. sem `fix`, faz o merge **squash** da PR usando o sha revisado (se o head mudou, revisa de novo)
-   e move a issue para `Done`. A branch `factory/<IDENTIFIER>` não é apagada.
+5. cada rodada posta um comentário de resumo na issue;
+6. com `fix`, uma sessão de correção roda os testes, faz push e começa nova rodada;
+7. sem `fix`, faz o merge **squash** da PR usando o sha revisado, **sem humano**, e move a issue
+   para `Done` (se o head mudou desde a review, revisa de novo, e isso conta rodada). A branch
+   `factory/<IDENTIFIER>` não é apagada.
 
-Depois de 3 rodadas (`MAX_REVIEW_ROUNDS`) sem aprovação, ou se a PR não puder ser mergeada
+**Arquivos sensíveis:** se o diff da PR muda `CLAUDE.md` (em qualquer diretório), qualquer coisa sob `.claude/`, `.github/workflows/`, `pytest.ini`, `tox.ini`, `setup.cfg`, `pyproject.toml`, `conftest.py`, `.pre-commit-config.yaml` e `Makefile`, o merge só acontece depois de uma pessoa
+confirmar com um reply na pergunta que o workflow posta (uma vez por sha revisado). A lista é
+calculada pelo orquestrador com `git diff --name-only`, antes de qualquer Claude, porque esses
+arquivos podem mudar o comportamento do próprio revisor, da CI ou dos testes.
+
+Depois de 3 rodadas (`MAX_REVIEW_ROUNDS`) sem merge (correção, review que falhou, testes
+vermelhos antes da review ou head que mudou antes do merge), ou se a PR não puder ser mergeada
 (conflito, branch protection), o workflow pergunta no Linear (**reply na thread**, 7 dias). Para
 parar, mova a issue para fora de `In Review`.
 

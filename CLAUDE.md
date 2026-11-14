@@ -71,7 +71,8 @@ src/software_factory/
     linear_activities.py  # LinearActivities: move_issue (muda o status por nome, no time da issue),
                           # post_comment e create_issue (idempotentes, com UUID gerado pelo cliente)
     review_activities.py  # ReviewActivities(sandbox): review_pull (duas lentes + triagem), implement_review_fix
-    review_prompts.py     # prompts da review, parse_review, REVIEW_DIR, FINDING_DETAIL_CAP
+    review_prompts.py     # prompts da review, parse_review, REVIEW_DIR, FINDING_DETAIL_CAP,
+                          # SENSITIVE_PATTERNS e sensitive_files
     sessions.py       # SessionWorkflow: base compartilhada (sessões, perguntas, espera de resposta) do implement e do review
     github_activities.py  # GitHubActivities: plan_exists, pull_request_info, open_pull_request, merge_pull_request
     workflow.py       # PlanIssueWorkflow: In Planning → sandbox → clone → plano → commit → kill (finally) → In Progress
@@ -100,7 +101,8 @@ tests/                # unittest; payloads.py tem fixtures no formato do Linear
   O webhook do Linear precisa dos recursos **Issues** e **Comments**.
 - Eventos ignorados retornam 200 para o Linear não reenviar.
 - `handle_issue` inicia o `PlanIssueWorkflow` com id `plan-issue-<issue.id>` (ou o
-  `ImplementIssueWorkflow` com id `implement-issue-<issue.id>`); se já houver um rodando responde
+  `ImplementIssueWorkflow` com id `implement-issue-<issue.id>`, ou o `ReviewIssueWorkflow` com id
+  `review-issue-<issue.id>`); se já houver um rodando responde
   `{"status": "duplicate"}`; se o Temporal estiver fora, 503 (o Linear reenvia).
 - O workflow hoje **gera o plano** com a skill `writing-plans` e o **commita** em
   `docs/superpowers/plans/<IDENTIFIER>.md` na branch `factory/<IDENTIFIER>` (push feito pela
@@ -138,7 +140,9 @@ tests/                # unittest; payloads.py tem fixtures no formato do Linear
   `STATUS_CHECK_RETRY`); resultado `OUTCOME_STOPPED`, sem PR. Falha inesperada: sem compensação,
   issue fica em `In Progress`.
 - **Review (`ReviewIssueWorkflow`, `In Review`):** exige PR aberta de `factory/<ID>` e o status `Done`
-  no time (validado no início). Cada rodada, em um sandbox, roda em paralelo as lentes `correctness`
+  no time (validado no início). Cada rodada, em um sandbox, roda primeiro `TEST_COMMAND` (`run_tests`,
+  12 min, sem retry) no head clonado: vermelho mata o sandbox, entra no `_fix_until_green`, conta
+  rodada e volta à review (nada vermelho é revisado nem mergeado). Verde: roda em paralelo as lentes `correctness`
   (`requesting-code-review`) e `security` (dois `claude -p` só leitura) sobre o diff inteiro da PR
   (merge-base → head, com o histórico das rodadas anteriores no prompt) e depois a triagem com
   `receiving-code-review`, que decide por achado: `fix` (bloqueia o merge), `issue` (follow-up no
@@ -146,10 +150,17 @@ tests/                # unittest; payloads.py tem fixtures no formato do Linear
   vira pergunta). Achado `minor` nunca vira `fix` (o loop converge). Follow-ups são criados **sem**
   label de gatilho (não encadeiam planejamento → implementação → review) e deduplicados entre
   rodadas. Cada rodada posta um comentário de resumo no Linear. Com `fix`, uma sessão de correção
-  (+ `run_tests`, commit e push) e nova rodada. Sem `fix`: merge squash da PR com `sha` = commit
-  revisado; se o head mudou desde a review, revisa de novo sem perguntar. PR que não pode ser mergeada
+  (+ `run_tests`, commit e push) e nova rodada. Sem `fix`: merge squash da PR **sem humano** com
+  `sha` = commit revisado; se o head mudou desde a review (`head_changed`), revisa de novo sem
+  perguntar, e isso conta rodada. **Arquivos sensíveis:** `review_pull` calcula, antes de qualquer
+  Claude, `git diff --name-only <base_sha> HEAD` filtrado por `SENSITIVE_PATTERNS`
+  (`review_prompts.py`: `CLAUDE.md` (em qualquer diretório), qualquer coisa sob `.claude/`, `.github/workflows/`, `pytest.ini`, `tox.ini`, `setup.cfg`, `pyproject.toml`, `conftest.py`, `.pre-commit-config.yaml` e `Makefile`) em `ReviewReport.sensitive_files`; se não estiver vazio, a review
+  aprovada pergunta no Linear antes do merge e a resposta confirma o merge daquele sha (não pergunta
+  de novo pelo mesmo sha). Título, detalhe, motivo e resumo vindos do LLM vão cercados (`_fence`) nos
+  prompts. Follow-ups: chave `lens + file + title` (sem a linha), título limitado a 200 caracteres. PR que não pode ser mergeada
   (conflito, branch protection) vira pergunta no Linear com o motivo, e a resposta reinicia a review.
-  Depois de `MAX_REVIEW_ROUNDS = 3` rodadas seguidas sem aprovação (sessão de review que falha conta)
+  Depois de `MAX_REVIEW_ROUNDS = 3` rodadas seguidas sem merge (correção, sessão de review que
+  falha, testes vermelhos antes da review e `head_changed` contam)
   o workflow pergunta como seguir; a resposta zera o contador. Parar: mover a issue para fora de
   `In Review` (checado antes de cada rodada e na espera; `OUTCOME_STOPPED`, sem merge). Merge feito:
   issue vai para `Done`. A branch `factory/<ID>` não é apagada.
