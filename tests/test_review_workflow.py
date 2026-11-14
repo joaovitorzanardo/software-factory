@@ -30,6 +30,7 @@ from software_factory.orchestration.models import (
     TestRunResult,
 )
 from software_factory.orchestration.review_workflow import (
+    FOLLOW_UP_TITLE_CAP,
     MAX_REVIEW_ROUNDS,
     ReviewIssueWorkflow,
     finding_key,
@@ -335,6 +336,29 @@ class TestReviewIssueWorkflow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.follow_ups, ("ENG-101",))
         # O resumo da segunda rodada ainda leva o link da issue já criada.
         self.assertIn("https://linear.app/acme/issue/ENG-101", fake.comments[1].body)
+
+    async def test_issue_finding_on_another_line_in_later_round_is_not_recreated(self) -> None:
+        fake = FakeReviewActivities(
+            reports=[
+                ReviewReport(
+                    "Follow-up e bug.", (finding("issue", "fora do escopo"), finding("fix", "bug"))
+                ),
+                # A correção deslocou o código: mesmo achado, outra linha.
+                ReviewReport("Só o follow-up.", (finding("issue", "fora do escopo", line=9),)),
+            ]
+        )
+        result = await self.run_workflow(fake)
+        self.assertEqual(result.outcome, "merged")
+        self.assertEqual(self.count(fake, "create_issue"), 1)
+        self.assertEqual(result.follow_ups, ("ENG-101",))
+
+    async def test_follow_up_title_is_capped(self) -> None:
+        fake = FakeReviewActivities(
+            reports=[ReviewReport("Título longo.", (finding("issue", "x" * 500),))]
+        )
+        await self.run_workflow(fake)
+        self.assertEqual(len(fake.issue_requests[0].title), FOLLOW_UP_TITLE_CAP)
+        self.assertTrue(fake.issue_requests[0].title.startswith("[ENG-12] xxx"))
 
     async def test_ask_finding_waits_for_answer_and_rereviews_with_clarification(self) -> None:
         fake = FakeReviewActivities(

@@ -37,6 +37,8 @@ MAX_REVIEW_ROUNDS = 3
 REVIEW_STUCK_QUESTION = (
     "Fiz {n} rodadas de review e correção sem aprovação. Como devo seguir?"
 )
+# Título da issue de follow-up (o título do achado vem do LLM, sem limite).
+FOLLOW_UP_TITLE_CAP = 200
 QUICK_CALL_TIMEOUT = timedelta(seconds=30)
 QUICK_CALL_RETRY = RetryPolicy(maximum_attempts=5)
 # mergeable=None (GitHub ainda calculando) vira erro retentável: espera entre tentativas.
@@ -49,8 +51,8 @@ def finding_where(f: ReviewFinding) -> str:
 
 def finding_key(f: ReviewFinding) -> str:
     """Chave do achado em `follow_ups`; achados iguais (na rodada ou em rodadas seguintes)
-    viram uma issue só."""
-    return f"{finding_where(f)}:{f.title}"
+    viram uma issue só. Sem a linha: uma correção que desloca o código não duplica a issue."""
+    return f"{f.lens}:{f.file}:{f.title}"
 
 
 def format_review_summary(
@@ -266,7 +268,7 @@ class ReviewIssueWorkflow(SessionWorkflow):
                     origin_issue_id=issue.issue_id,
                     # Determinístico no replay: o retry da activity reaproveita a issue criada.
                     new_issue_id=str(workflow.uuid4()),
-                    title=f"[{issue.identifier}] {f.title}",
+                    title=f"[{issue.identifier}] {f.title}"[:FOLLOW_UP_TITLE_CAP],
                     description=follow_up_description(issue, f),
                 ),
                 start_to_close_timeout=QUICK_CALL_TIMEOUT,
