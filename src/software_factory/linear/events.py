@@ -2,6 +2,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
+from software_factory.orchestration.models import STATE_IN_PROGRESS
+
 
 @dataclass(frozen=True)
 class LinearIssue:
@@ -42,6 +44,19 @@ def should_process(payload: dict[str, Any], trigger_labels: Iterable[str]) -> bo
         previous = set(updated_from["labelIds"] or [])
         return bool(trigger_ids - previous)
     return False
+
+
+def should_implement(payload: dict[str, Any], trigger_labels: Iterable[str]) -> bool:
+    """Issue com label de gatilho cujo status acabou de mudar para In Progress."""
+    if payload.get("type") != "Issue" or payload.get("action") != "update":
+        return False
+    if "stateId" not in (payload.get("updatedFrom") or {}):
+        return False
+    data = payload.get("data") or {}
+    state = data.get("state") or {}
+    if str(state.get("name", "")).lower() != STATE_IN_PROGRESS.lower():
+        return False
+    return bool(_trigger_label_ids(data, trigger_labels))
 
 
 def parse_issue(payload: dict[str, Any]) -> LinearIssue:
