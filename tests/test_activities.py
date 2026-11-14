@@ -446,7 +446,7 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(sha, "abc123")
         runs = FakeSandbox.instance.commands.runs
-        self.assertIn("git clone --depth 1 --branch factory/ENG-12", runs[0]["cmd"])
+        self.assertIn("git clone --depth 50 --branch factory/ENG-12", runs[0]["cmd"])
         self.assertIn("$GITHUB_TOKEN@github.com/acme/app.git", runs[0]["cmd"])
         self.assertEqual(runs[0]["envs"], {"GITHUB_TOKEN": "gh-token"})
         self.assertEqual(

@@ -49,6 +49,7 @@ ANALYZE_COMMAND_TIMEOUT_S = 25 * 60
 TEST_OUTPUT_TAIL = 4000
 HEARTBEAT_INTERVAL_S = 30
 GIT_COMMAND_TIMEOUT_S = 60
+CLONE_BRANCH_DEPTH = 50
 GIT_AUTHOR_NAME = "software-factory"
 GIT_AUTHOR_EMAIL = "software-factory@users.noreply.github.com"
 
@@ -359,8 +360,10 @@ class SandboxActivities:
         branch = plan_branch(request.identifier)
         sandbox = await self._connect(request.sandbox_id)
         if not await sandbox.files.exists(f"{REPO_DIR}/.git"):
+            # Histórico recente para a análise ver o que mudou (sem token no origin, não dá
+            # para aprofundar depois).
             await sandbox.commands.run(
-                f"git clone --depth 1 --branch {branch} {self._authed_url()} {REPO_DIR}",
+                f"git clone --depth {CLONE_BRANCH_DEPTH} --branch {branch} {self._authed_url()} {REPO_DIR}",
                 envs={"GITHUB_TOKEN": self.settings.github_token},
                 timeout=5 * 60,
             )
