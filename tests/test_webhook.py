@@ -4,13 +4,15 @@ import unittest
 from unittest import mock
 
 from fastapi.testclient import TestClient
+from temporalio.service import RPCError, RPCStatusCode
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
 from software_factory.api import create_app
 from software_factory.config import Settings
 from software_factory.orchestration.implement_workflow import ImplementIssueWorkflow
+from software_factory.orchestration.models import HumanAnswer
 from software_factory.orchestration.workflow import PlanIssueWorkflow
-from tests.payloads import DOCS, FEATURE, issue_payload
+from tests.payloads import DOCS, FEATURE, comment_payload, issue_payload
 from tests.test_signature import SECRET, sign
 
 
@@ -22,11 +24,27 @@ class FakeTemporalClient:
     def __init__(self, error: Exception | None = None) -> None:
         self.error = error
         self.started: list[tuple[tuple, dict]] = []
+        self.signals: list[tuple[str, object, object]] = []
+        self.signal_error: Exception | None = None
+
+    def get_workflow_handle(self, workflow_id: str) -> "FakeHandle":
+        return FakeHandle(self, workflow_id)
 
     async def start_workflow(self, *args, **kwargs) -> None:
         self.started.append((args, kwargs))
         if self.error:
             raise self.error
+
+
+class FakeHandle:
+    def __init__(self, client: FakeTemporalClient, workflow_id: str) -> None:
+        self.client = client
+        self.workflow_id = workflow_id
+
+    async def signal(self, signal, arg) -> None:
+        if self.client.signal_error:
+            raise self.client.signal_error
+        self.client.signals.append((self.workflow_id, signal, arg))
 
 
 class TestLinearWebhook(unittest.TestCase):
@@ -142,6 +160,34 @@ class TestLinearWebhook(unittest.TestCase):
             "/webhooks/linear", content=body, headers=self.headers(body)
         )
         self.assertEqual(response.status_code, 503)
+
+
+    def post_comment(self, **kwargs):
+        body = json.dumps(comment_payload(webhook_timestamp=now_ms(), **kwargs)).encode()
+        return self.post(body)
+
+    def test_reply_signals_implement_workflow(self) -> None:
+        response = self.post_comment()
+        self.assertEqual(response.json(), {"status": "accepted"})
+        ((wf_id, signal, arg),) = self.temporal.signals
+        self.assertEqual(wf_id, "implement-issue-issue-uuid")
+        self.assertEqual(signal, ImplementIssueWorkflow.human_answer)
+        self.assertEqual(arg, HumanAnswer("question-1", "comment-1", "Use bcrypt"))
+
+    def test_reply_without_running_workflow_is_ignored(self) -> None:
+        self.temporal.signal_error = RPCError("not found", RPCStatusCode.NOT_FOUND, b"")
+        response = self.post_comment()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"status": "ignored"})
+
+    def test_reply_with_temporal_down_is_503(self) -> None:
+        self.temporal.signal_error = RuntimeError("down")
+        self.assertEqual(self.post_comment().status_code, 503)
+
+    def test_top_level_comment_is_ignored(self) -> None:
+        response = self.post_comment(parent_id=None)
+        self.assertEqual(response.json(), {"status": "ignored"})
+        self.assertEqual(self.temporal.signals, [])
 
 
 if __name__ == "__main__":

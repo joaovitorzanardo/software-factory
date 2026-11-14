@@ -14,7 +14,9 @@ O caminho completo que queremos automatizar é:
 
 Hoje (fase de teste) a fábrica faz as quatro etapas: ela recebe a issue, escreve o plano e salva
 esse plano numa branch do repositório; quando a issue entra em `In Progress`, implementa o plano,
-roda os testes e, só se estiverem verdes, abre o PR e move a issue para `In Review`.
+roda os testes e, se ficarem vermelhos, entra num loop de análise e correção até ficarem verdes;
+só então abre o PR e move a issue para `In Review`. Dúvidas grandes viram comentário na issue, e a
+resposta é um reply nesse comentário.
 
 Quem faz o trabalho "inteligente" é o **Claude Code**, rodando dentro de uma máquina isolada e
 descartável (sandbox do **E2B**). Quem coordena os passos, tenta de novo quando algo falha e
@@ -57,7 +59,9 @@ flowchart TD
         T --> U[Clona a branch factory/IDENTIFIER]
         U --> V[Claude Code implementa o plano]
         V --> Y{Testes verdes?}
-        Y -- não --> Y1([Falha; sandbox destruído,<br/>issue fica em In Progress])
+        Y -- não --> Y1[Checkpoint wip na branch;<br/>Claude analisa e corrige<br/>em novos sandboxes]
+        Y1 -. pergunta no Linear,<br/>reply da pessoa .-> Y1
+        Y1 --> Y
         Y -- sim --> Z[Commit e push na branch]
         Z --> Z1[Destrói o sandbox<br/>sempre, mesmo em falha]
         Z1 --> Z2[Abre o Pull Request]
@@ -139,18 +143,27 @@ Quando a issue entra em `In Progress` (movida pelo `PlanIssueWorkflow` ou por um
    `In Review` e `In Planning` existem no time;
 2. checa pela API do GitHub se o plano existe em `factory/<IDENTIFIER>`; se não existe, move a
    issue de volta para `In Planning` e encerra, sem criar sandbox;
-3. cria um sandbox E2B e clona a branch `factory/<IDENTIFIER>` — o `origin` fica sem o token
+3. cria um sandbox E2B e clona a branch `factory/<IDENTIFIER>` (últimos 50 commits) — o `origin` fica sem o token
    (o Claude roda com `Bash` liberado; isso dificulta, mas não impede, que ele chegue ao token,
    já que o push depois roda no mesmo sandbox);
 4. roda `claude -p` para implementar o plano (até 30 min, sem retry);
-5. roda `TEST_COMMAND` no repo (o orquestrador não confia no relato do Claude); com testes
-   vermelhos o workflow falha, sem push nem PR;
-6. commita o que faltar e faz push na branch (o token só entra no ambiente desse comando);
-7. destrói o sandbox (sempre, inclusive em falha);
-8. abre o PR `factory/<IDENTIFIER>` → branch default pela API REST do GitHub (reaproveita um PR
+5. roda `TEST_COMMAND` no repo (o orquestrador não confia no relato do Claude); estourar o timeout
+   de 10 min conta como vermelho;
+6. com verde, commita o que faltar e faz push na branch (o token só entra no ambiente desse
+   comando; commit e push rodam com os hooks do repo desligados); o sandbox é destruído (sempre, inclusive em falha);
+7. abre o PR `factory/<IDENTIFIER>` → branch default pela API REST do GitHub (reaproveita um PR
    já aberto) e move a issue para `In Review`.
 
-Em falha a issue fica em `In Progress`.
+Com testes vermelhos, o workflow entra no **loop de correção**: faz push de um checkpoint
+`wip: tentativa <n> de <IDENTIFIER> (testes vermelhos)` na branch (a PR só abre com verde) e repete,
+cada passo em seu próprio sandbox, analisar a falha (skill `systematic-debugging`, vendorizada),
+planejar e corrigir, até os testes ficarem verdes. Uma sessão de análise ou de correção que falha
+(erro ou timeout do Claude) não encerra o loop: vira mais uma tentativa vermelha. Se o Claude tiver uma dúvida que só uma pessoa
+resolve, ou depois de 5 correções seguidas sem verde, o workflow posta uma pergunta como
+comentário na issue e espera; **responda com um reply na thread desse comentário** (sem resposta em
+7 dias o workflow falha). Para parar o loop, mova a issue para fora de `In Progress` (o status é
+conferido antes de cada tentativa e a cada hora durante a espera); nesse caso termina sem PR.
+Qualquer outra falha (sandbox, clone, push, a implementação inicial) deixa a issue em `In Progress`.
 
 ## Executar (servidor de webhooks)
 
@@ -178,14 +191,17 @@ cloudflared tunnel --url http://localhost:8000
 No Linear: **Settings → API → Webhooks → New webhook**
 
 - URL: `https://<túnel>/webhooks/linear`
-- Resource types: **Issues**
+- Resource types: **Issues** e **Comments** (os replies às perguntas do loop chegam como
+  comentários)
 - Copie o *signing secret* para `LINEAR_WEBHOOK_SECRET` no `.env`
 
 O endpoint valida a assinatura (`Linear-Signature`, 401 se inválida) e o
 `webhookTimestamp` (400 se tiver mais de 60s). Com label `Feature`/`Bug`, issues **criadas**
 ou **atualizadas** recebendo uma dessas labels iniciam o planejamento, e issues cujo status
 **mudou para `In Progress`** iniciam a implementação (se o mesmo evento adiciona a label e muda
-o status, vale só o planejamento). Os demais eventos retornam 200 `{"status": "ignored"}`.
+o status, vale só o planejamento). Comentários criados como **reply** numa thread viram o signal `human_answer` do workflow de
+implementação da issue (`accepted`, ou `ignored` se não houver um rodando). Os demais eventos
+retornam 200 `{"status": "ignored"}`.
 Issues aceitas iniciam o workflow (`{"status": "accepted"}`, ou `"duplicate"` se já houver um
 rodando para a issue);
 se o Temporal estiver indisponível, responde 503 para o Linear reenviar.

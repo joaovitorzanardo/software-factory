@@ -2,7 +2,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
-from software_factory.orchestration.models import STATE_IN_PROGRESS
+from software_factory.orchestration.models import STATE_IN_PROGRESS, HumanAnswer
 
 
 @dataclass(frozen=True)
@@ -14,6 +14,12 @@ class LinearIssue:
     url: str | None
     team_key: str | None
     labels: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CommentReply:
+    issue_id: str
+    answer: HumanAnswer
 
 
 def _trigger_label_ids(data: dict[str, Any], trigger_labels: Iterable[str]) -> set[str]:
@@ -70,4 +76,20 @@ def parse_issue(payload: dict[str, Any]) -> LinearIssue:
         url=payload.get("url") or data.get("url"),
         team_key=team.get("key"),
         labels=tuple(label["name"] for label in data.get("labels") or []),
+    )
+
+
+def parse_reply(payload: dict[str, Any]) -> CommentReply | None:
+    """Comentário criado como reply (tem parentId) numa issue; senão None."""
+    if payload.get("type") != "Comment" or payload.get("action") != "create":
+        return None
+    data = payload.get("data") or {}
+    parent_id, issue_id, body = data.get("parentId"), data.get("issueId"), data.get("body")
+    if not parent_id or not issue_id or not body:
+        return None
+    return CommentReply(
+        issue_id=issue_id,
+        answer=HumanAnswer(
+            question_id=parent_id, comment_id=str(data.get("id", "")), body=body
+        ),
     )

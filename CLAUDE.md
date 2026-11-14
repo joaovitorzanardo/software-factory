@@ -18,8 +18,8 @@ Software factory experimental (fase de teste). O objetivo é automatizar o ciclo
 - **Fonte de tarefas:** Linear (issues), recebidas via webhook.
 - **HTTP:** FastAPI + uvicorn (servidor de webhooks).
 - **Sandbox:** [E2B](https://docs.e2b.dev) (SDK `e2b`, `AsyncSandbox`), template `claude`
-  (Claude Code pré-instalado). **Um sandbox por execução de workflow (issue)**, sempre destruído
-  no `finally`. Plano Hobby: ~1h contínua por sandbox — timeouts das activities ficam abaixo disso.
+  (Claude Code pré-instalado). **Um sandbox por sessão** (planejamento, análise de falha ou correção; cada
+  um com orçamento próprio de 55 min), sempre destruído no `finally`. Plano Hobby: ~1h contínua por sandbox — timeouts das activities ficam abaixo disso.
 - **Invocação do Claude Code:** CLI headless dentro do sandbox
   (`claude -p --output-format stream-json --verbose`). Auth: exatamente uma de
   `ANTHROPIC_API_KEY` (API) ou `CLAUDE_CODE_OAUTH_TOKEN` (assinatura, `claude setup-token`;
@@ -34,6 +34,8 @@ Software factory experimental (fase de teste). O objetivo é automatizar o ciclo
   puro (`linear/client.py`, sem SDK); personal API key em `LINEAR_API_KEY` (worker), com escrita em issues.
 - **Planejamento:** skill `writing-plans` do superpowers 7.0.0, vendorizada em
   `orchestration/skills/` (MIT) e copiada para `~/.claude/skills/` no sandbox — sem instalar plugin via rede.
+- **Correção de testes vermelhos:** skill `systematic-debugging` do superpowers 7.0.2, vendorizada
+  ao lado (MIT); `install_skills` copia tudo que está em `orchestration/skills/`.
 
 Ainda **não definidos** (não assumir sem confirmar com o usuário): persistência e deploy. Ao introduzir qualquer tecnologia nova,
 pergunte antes e atualize esta seção.
@@ -49,22 +51,28 @@ src/software_factory/
   linear/
     client.py         # LinearClient: POST GraphQL com httpx; erros → ApplicationError (retentável ou não)
     signature.py      # validação HMAC do Linear-Signature + anti-replay
-    events.py         # LinearIssue, should_process (filtro por label), parse_issue
-    webhook.py        # POST /webhooks/linear; handle_issue inicia o PlanIssueWorkflow ou o ImplementIssueWorkflow
+    events.py         # LinearIssue, should_process (filtro por label), parse_issue,
+                      # CommentReply e parse_reply (reply de comentário → HumanAnswer)
+    webhook.py        # POST /webhooks/linear; handle_issue inicia o PlanIssueWorkflow ou o ImplementIssueWorkflow;
+                      # handle_reply envia o signal human_answer ao ImplementIssueWorkflow
   github/
     client.py         # GitHubClient: REST com httpx (default_branch, get_file, find_open_pull, create_pull)
   orchestration/
     models.py         # dataclasses de entrada/saída (PlanIssueInput, PlanRequest, CommitPlanRequest,
                       # MoveIssueRequest, PlanResult, CloneBranchRequest, ImplementRequest, TestRunResult,
-                      # CommitImplementationRequest, PullRequestRequest, ImplementResult), STATE_* e OUTCOME_*
+                      # CommitImplementationRequest, PullRequestRequest, ImplementResult e, do loop de correção,
+                      # FixAttempt, Clarification, AnalyzeRequest, FixAnalysis, FixRequest, CommentRequest,
+                      # HumanAnswer), STATE_* e OUTCOME_*
     activities.py     # SandboxActivities: create_sandbox, clone_repo, generate_plan, commit_plan,
-                      # clone_branch, implement_plan, run_tests, commit_implementation, kill_sandbox
-    linear_activities.py  # LinearActivities.move_issue: muda o status da issue (por nome, no time dela)
+                      # clone_branch, implement_plan, analyze_failure, implement_fix, run_tests,
+                      # commit_implementation, kill_sandbox; install_skills (copia orchestration/skills/)
+    linear_activities.py  # LinearActivities: move_issue (muda o status por nome, no time da issue) e
+                          # post_comment (idempotente, com UUID gerado pelo cliente)
     github_activities.py  # GitHubActivities: plan_exists, open_pull_request
     workflow.py       # PlanIssueWorkflow: In Planning → sandbox → clone → plano → commit → kill (finally) → In Progress
     implement_workflow.py # ImplementIssueWorkflow: plano existe? → sandbox → clone da branch → implementa →
-                      # testes → push → kill (finally) → PR → In Review
-    skills/writing-plans/  # SKILL.md + LICENSE vendorizados do superpowers
+                      # testes → (verde: push → PR → In Review; vermelho: loop analisar → planejar → corrigir)
+    skills/writing-plans/, skills/systematic-debugging/  # vendorizadas do superpowers (SKILL.md + LICENSE)
     worker.py         # entrypoint `software-factory-worker`
 tests/                # unittest; payloads.py tem fixtures no formato do Linear
 ```
@@ -76,6 +84,10 @@ tests/                # unittest; payloads.py tem fixtures no formato do Linear
 - Gatilho da implementação: `update` com `stateId` em `updatedFrom` e `data.state.name ==
   "In Progress"` (case-insensitive), em issue com label de gatilho. Evento que adiciona a label
   **e** muda o status dispara só o planejamento.
+- Gatilho da resposta: `Comment` `create` com `parentId` (reply na thread) numa issue; `handle_reply`
+  envia o signal `human_answer` ao workflow `implement-issue-<issue.id>` (`{"status": "accepted"}`);
+  sem workflow rodando (`NOT_FOUND`) ou comentário fora de thread → `ignored`; outro erro → 503.
+  O webhook do Linear precisa dos recursos **Issues** e **Comments**.
 - Eventos ignorados retornam 200 para o Linear não reenviar.
 - `handle_issue` inicia o `PlanIssueWorkflow` com id `plan-issue-<issue.id>` (ou o
   `ImplementIssueWorkflow` com id `implement-issue-<issue.id>`); se já houver um rodando responde
@@ -86,13 +98,35 @@ tests/                # unittest; payloads.py tem fixtures no formato do Linear
   já existir no remoto com outro conteúdo, falha sem force push.
 - O `ImplementIssueWorkflow` confere que a issue segue em `In Progress` (senão encerra), checa o
   plano via API do GitHub antes de criar sandbox (sem plano → move para `In Planning`), clona
-  `factory/<IDENTIFIER>` com o token **fora** do `origin` (defesa parcial: o push roda depois no
+  `factory/<IDENTIFIER>` (`--depth 50`, para a análise ver o histórico recente) com o token **fora** do `origin` (defesa parcial: o push roda depois no
   mesmo sandbox em que o Claude teve `Bash`, então o token deve ser tratado como exposto), roda o Claude com `Bash`
-  (`implement_plan`, 30 min, sem retry), roda `TEST_COMMAND` (`run_tests`), e só com verde faz
-  push (`commit_implementation`, sem force push; falha se o Claude não mudou nada), destrói o
-  sandbox, abre a PR `factory/<ID>` → branch default (reaproveita PR aberta) e move para
-  `In Review`. Testes vermelhos ou qualquer falha: sem PR, sem compensação, issue fica em
-  `In Progress`.
+  (`implement_plan`, 30 min, sem retry), roda `TEST_COMMAND` (`run_tests`; timeout de 10 min =
+  vermelho) e destrói o sandbox. Commit/push do orquestrador (`commit_plan`, `commit_implementation`)
+  rodam com `-c core.hooksPath=/dev/null`. Falha da sessão inicial (`implement_plan`) falha o workflow.
+  Verde: push (`commit_implementation`, sem force push; falha se o Claude não mudou nada), abre a
+  PR `factory/<ID>` → branch default (reaproveita PR aberta) e move para `In Review`.
+- **Loop de correção (vermelho):** em vez de falhar, repete analisar → planejar → corrigir → testar
+  até ficar verde. Cada sessão tem seu sandbox: análise (`analyze_failure`, skill
+  `systematic-debugging`, escreve `analysis.md`, `plan.md` e, se precisar, `question.md` em
+  `/home/user/fix`, fora do repo) e correção (`implement_fix` + `run_tests` + commit). Sessão
+  vermelha faz push de checkpoint `wip: tentativa <n> de <ID> (testes vermelhos)` em
+  `factory/<ID>` (sem force push); a PR só abre com verde. Só as `ATTEMPTS_IN_PROMPT = 3` últimas
+  tentativas vão para o prompt (análise truncada em 3000 caracteres). Prompts proíbem
+  apagar/pular/enfraquecer testes e mudar `TEST_COMMAND`.
+- **Falha de sessão alimenta o loop:** `implement_fix` que falha (erro, timeout) vira tentativa
+  vermelha com saída `implement_fix falhou: <msg>`, com checkpoint `wip: ... (correção falhou)` de
+  melhor esforço no mesmo sandbox; `analyze_failure` que falha registra a tentativa
+  `análise falhou: <msg>` e reanalisa. Ambas contam para `MAX_FIX_ATTEMPTS`. Falhas de
+  `create_sandbox`, `clone_branch`, commit e `post_comment` ainda falham o workflow.
+- **Perguntas humanas:** se a análise gera `question.md`, ou após `MAX_FIX_ATTEMPTS = 5` correções
+  seguidas sem verde (o próprio workflow pergunta; a resposta zera o contador), o workflow posta
+  um comentário no Linear (`post_comment`, id gerado com `workflow.uuid4()`; vale o id devolvido) e
+  espera o signal `human_answer`. A pergunta de travamento entra nas clarificações só como rótulo curto. A resposta é um **reply na thread** da pergunta (`parentId` == id do comentário).
+  Sem resposta em `HUMAN_ANSWER_TIMEOUT = 7 dias` o workflow falha.
+- **Parar o loop:** mover a issue para fora de `In Progress`. O status é checado antes de cada
+  tentativa e, na espera, a cada `ANSWER_POLL_INTERVAL = 1h` (retry ilimitado,
+  `STATUS_CHECK_RETRY`); resultado `OUTCOME_STOPPED`, sem PR. Falha inesperada: sem compensação,
+  issue fica em `In Progress`.
 - Status no Linear: o workflow começa movendo a issue `To Do → In Planning` (só se estiver em
   `To Do`; senão planeja sem mover) e, depois do commit do plano e do kill do sandbox, move para
   `In Progress`. Status procurados por nome (case-insensitive) no time da issue; status inexistente

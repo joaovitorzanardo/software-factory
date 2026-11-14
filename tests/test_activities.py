@@ -5,22 +5,36 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 from unittest import mock
 
-from e2b import CommandExitException, FileNotFoundException
+from e2b import CommandExitException, FileNotFoundException, TimeoutException
+from e2b.retry import resolve_idempotency_key
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
 from software_factory.config import FactorySettings
 from software_factory.orchestration.activities import (
+    ANALYSIS_PATH,
+    FIX_DIR,
+    FIX_PLAN_PATH,
+    FIX_PROMPT_PATH,
+    QUESTION_PATH,
     REPO_DIR,
+    SKILLS_DEST_DIR,
     SandboxActivities,
+    build_analyze_prompt,
+    build_fix_prompt,
     build_implement_prompt,
     build_plan_prompt,
     plan_path,
 )
 from software_factory.orchestration.models import (
+    AnalyzeRequest,
     CloneBranchRequest,
+    Clarification,
     CommitImplementationRequest,
     CommitPlanRequest,
+    FixAnalysis,
+    FixAttempt,
+    FixRequest,
     ImplementRequest,
     PlanIssueInput,
     PlanRequest,
@@ -137,7 +151,7 @@ class FakeSandbox:
 
 
 PLAN_FILE = f"{REPO_DIR}/docs/superpowers/plans/ENG-12.md"
-SKILL_DEST = "/home/user/.claude/skills/writing-plans/SKILL.md"
+SKILL_DEST = f"{SKILLS_DEST_DIR}/writing-plans/SKILL.md"
 
 
 def stream(*events: dict[str, Any]) -> str:
@@ -213,6 +227,34 @@ class TestBuildImplementPrompt(unittest.TestCase):
         self.assertIn("sem descrição", build_implement_prompt(issue, "make test"))
 
 
+class TestFixPrompts(unittest.TestCase):
+    def test_analyze_prompt(self) -> None:
+        request = AnalyzeRequest(
+            "sbx-1", ISSUE, test_output="FAILED test_login",
+            attempts=(FixAttempt(1, "faltava hash", "FAILED test_hash"),),
+            clarifications=(Clarification("Usar bcrypt?", "Sim"),),
+        )
+        prompt = build_analyze_prompt(request, "python -m pytest")
+        for text in ("systematic-debugging", "writing-plans", ANALYSIS_PATH, FIX_PLAN_PATH,
+                     QUESTION_PATH, "FAILED test_login", "faltava hash", "FAILED test_hash",
+                     "Usar bcrypt?", "Sim", "python -m pytest", "docs/superpowers/plans/ENG-12.md"):
+            self.assertIn(text, prompt)
+        self.assertIn("apagar, pular ou afrouxar testes", prompt)
+
+    def test_analyze_prompt_omits_empty_sections(self) -> None:
+        prompt = build_analyze_prompt(AnalyzeRequest("sbx-1", ISSUE, "FAILED"), "make test")
+        self.assertNotIn("Tentativas anteriores", prompt)
+        self.assertNotIn("Decisões da pessoa", prompt)
+
+    def test_fix_prompt(self) -> None:
+        prompt = build_fix_prompt(
+            FixRequest("sbx-1", ISSUE, "análise", "plano",
+                       (Clarification("Usar bcrypt?", "Sim"),)), "python -m pytest")
+        for text in (FIX_PLAN_PATH, ANALYSIS_PATH, "python -m pytest", "git push",
+                     "Usar bcrypt?", "apagar, pular ou afrouxar testes"):
+            self.assertIn(text, prompt)
+
+
 class TestPlanPath(unittest.TestCase):
     def test_plan_path(self) -> None:
         self.assertEqual(plan_path("ENG-12"), "docs/superpowers/plans/ENG-12.md")
@@ -239,8 +281,26 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call["template"], "claude")
         self.assertEqual(call["envs"], {"ANTHROPIC_API_KEY": "anthropic-key"})
         self.assertEqual(call["metadata"], {"issue_id": "issue-1"})
-        self.assertEqual(call["idempotency_key"], self.env.info.workflow_id)
+        info = self.env.info
+        self.assertEqual(
+            call["idempotency_key"],
+            f"{info.workflow_id}-{info.workflow_run_id}-{info.activity_id}".lower(),
+        )
         self.assertEqual(call["api_key"], "e2b-key")
+
+    async def test_create_sandbox_idempotency_key_accepted_by_e2b(self) -> None:
+        # IDs reais do Temporal: workflow id do webhook, run id UUID e activity id numérico.
+        info = replace(
+            self.env.info,
+            workflow_id="implement-issue-9b1D2c3e-AAAA",
+            workflow_run_id="0193A1B2-C3D4-7E5F-8091-A2B3C4D5E6F7",
+            activity_id="12",
+        )
+        env = ActivityEnvironment()
+        env.info = info
+        await env.run(self.activities.create_sandbox, "issue-1")
+        (call,) = FakeSandbox.create_calls
+        self.assertEqual(resolve_idempotency_key(call["idempotency_key"]), call["idempotency_key"])
 
     async def test_create_sandbox_with_oauth_token(self) -> None:
         settings = replace(SETTINGS, anthropic_api_key=None, claude_code_oauth_token="oat-token")
@@ -347,12 +407,13 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
             [
                 "git checkout -B factory/ENG-12",
                 "git add docs/superpowers/plans/ENG-12.md",
-                'git diff --cached --quiet || git -c user.name="software-factory"'
+                "git diff --cached --quiet || git -c core.hooksPath=/dev/null"
+                ' -c user.name="software-factory"'
                 ' -c user.email="software-factory@users.noreply.github.com"'
                 ' commit -m "docs: plano de implementação ENG-12"',
                 "git rev-parse HEAD",
                 "git ls-remote --heads origin refs/heads/factory/ENG-12",
-                "git push -u origin factory/ENG-12",
+                "git -c core.hooksPath=/dev/null push -u origin factory/ENG-12",
             ],
         )
         for run in FakeSandbox.instance.commands.runs:
@@ -362,14 +423,14 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
     async def test_commit_plan_idempotent_after_push(self) -> None:
         branch = await self.run_commit_plan(remote="abc123\trefs/heads/factory/ENG-12\n")
         self.assertEqual(branch, "factory/ENG-12")
-        self.assertFalse(any("git push" in cmd for cmd in self.commands()))
+        self.assertFalse(any(" push " in cmd for cmd in self.commands()))
 
     async def test_commit_plan_rejects_diverged_remote(self) -> None:
         with self.assertRaises(ApplicationError) as ctx:
             await self.run_commit_plan(remote="zzz999\trefs/heads/factory/ENG-12\n")
         self.assertTrue(ctx.exception.non_retryable)
         self.assertIn("factory/ENG-12", str(ctx.exception))
-        self.assertFalse(any("git push" in cmd for cmd in self.commands()))
+        self.assertFalse(any(" push " in cmd for cmd in self.commands()))
 
     async def test_commit_plan_missing_plan_file(self) -> None:
         with self.assertRaises(ApplicationError):
@@ -386,7 +447,7 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(sha, "abc123")
         runs = FakeSandbox.instance.commands.runs
-        self.assertIn("git clone --depth 1 --branch factory/ENG-12", runs[0]["cmd"])
+        self.assertIn("git clone --depth 50 --branch factory/ENG-12", runs[0]["cmd"])
         self.assertIn("$GITHUB_TOKEN@github.com/acme/app.git", runs[0]["cmd"])
         self.assertEqual(runs[0]["envs"], {"GITHUB_TOKEN": "gh-token"})
         self.assertEqual(
@@ -455,12 +516,44 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result.output), 4000)
         self.assertTrue(result.output.endswith("FAILED test_a"))
 
-    async def run_commit_implementation(self, head: str, remote: str) -> str:
+    async def test_run_tests_timeout_is_red(self) -> None:
+        def time_out(cmd: str) -> None:
+            raise TimeoutException("context deadline exceeded")
+
+        FakeSandbox.instance.commands.on_run = time_out
+        result = await self.env.run(self.activities.run_tests, "sbx-1")
+        self.assertFalse(result.passed)
+        self.assertIn("TEST_COMMAND estourou o timeout de 10 min", result.output)
+
+    async def run_commit_implementation(self, head: str, remote: str, **kwargs: Any) -> str:
         FakeSandbox.instance.commands.responses = {"rev-parse": head, "ls-remote": remote}
         return await self.env.run(
             self.activities.commit_implementation,
-            CommitImplementationRequest(sandbox_id="sbx-1", identifier="ENG-12", base_sha="abc123"),
+            CommitImplementationRequest(
+                sandbox_id="sbx-1", identifier="ENG-12", base_sha="abc123", **kwargs
+            ),
         )
+
+    async def test_commit_implementation_checkpoint_message(self) -> None:
+        await self.run_commit_implementation(
+            "def456\n",
+            "abc123\trefs/heads/factory/ENG-12\n",
+            message="wip: tentativa 1 de ENG-12 (testes vermelhos)",
+            require_changes=False,
+        )
+        runs = FakeSandbox.instance.commands.runs
+        commit = next(r["cmd"] for r in runs if " commit " in r["cmd"])
+        self.assertIn('-m "wip: tentativa 1 de ENG-12 (testes vermelhos)"', commit)
+        self.assertTrue(any(" push " in r["cmd"] for r in runs))
+
+    async def test_commit_implementation_no_changes_allowed(self) -> None:
+        result = await self.run_commit_implementation(
+            "abc123\n", "abc123\trefs/heads/factory/ENG-12\n", require_changes=False
+        )
+        self.assertEqual(result, "factory/ENG-12")
+        runs = FakeSandbox.instance.commands.runs
+        self.assertFalse(any(" push " in r["cmd"] for r in runs))
+        self.assertFalse(any("ls-remote" in r["cmd"] for r in runs))
 
     async def test_commit_implementation_pushes(self) -> None:
         branch = await self.run_commit_implementation(
@@ -469,10 +562,12 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(branch, "factory/ENG-12")
         runs = FakeSandbox.instance.commands.runs
         self.assertEqual(runs[0]["cmd"], "git add -A")
-        self.assertIn('git commit -m "feat: implementa ENG-12"', runs[1]["cmd"])
+        self.assertIn(
+            'git -c core.hooksPath=/dev/null commit -m "feat: implementa ENG-12"', runs[1]["cmd"]
+        )
         self.assertEqual(
             runs[-1]["cmd"],
-            'git push "https://x-access-token:$GITHUB_TOKEN@github.com/acme/app.git"'
+            'git -c core.hooksPath=/dev/null push "https://x-access-token:$GITHUB_TOKEN@github.com/acme/app.git"'
             " HEAD:refs/heads/factory/ENG-12",
         )
         self.assertEqual(runs[-1]["envs"], {"GITHUB_TOKEN": "gh-token"})
@@ -487,19 +582,69 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
             "def456\n", "def456\trefs/heads/factory/ENG-12\n"
         )
         self.assertEqual(branch, "factory/ENG-12")
-        self.assertFalse(any("git push" in cmd for cmd in self.commands()))
+        self.assertFalse(any(" push " in cmd for cmd in self.commands()))
 
     async def test_commit_implementation_rejects_no_changes(self) -> None:
         with self.assertRaises(ApplicationError) as ctx:
             await self.run_commit_implementation("abc123\n", "abc123\trefs/heads/factory/ENG-12\n")
         self.assertTrue(ctx.exception.non_retryable)
-        self.assertFalse(any("ls-remote" in cmd or "git push" in cmd for cmd in self.commands()))
+        self.assertFalse(any("ls-remote" in cmd or " push " in cmd for cmd in self.commands()))
 
     async def test_commit_implementation_rejects_moved_remote(self) -> None:
         with self.assertRaises(ApplicationError) as ctx:
             await self.run_commit_implementation("def456\n", "zzz999\trefs/heads/factory/ENG-12\n")
         self.assertTrue(ctx.exception.non_retryable)
-        self.assertFalse(any("git push" in cmd for cmd in self.commands()))
+        self.assertFalse(any(" push " in cmd for cmd in self.commands()))
+
+    def claude_writes(self, files_to_write: dict[str, str]) -> None:
+        files = FakeSandbox.instance.files
+
+        def on_run(cmd: str) -> None:
+            if "claude -p" in cmd:
+                files.written.update(files_to_write)
+
+        FakeSandbox.instance.commands.on_run = on_run
+        FakeSandbox.instance.commands.stdout = stream(
+            {"type": "result", "subtype": "success", "result": "<texto do result>"}
+        )
+
+    async def test_analyze_failure_returns_plan(self) -> None:
+        self.claude_writes({ANALYSIS_PATH: "causa", FIX_PLAN_PATH: "plano"})
+        result = await self.env.run(
+            self.activities.analyze_failure, AnalyzeRequest("sbx-1", ISSUE, "FAILED")
+        )
+        self.assertEqual(result, FixAnalysis(analysis="causa", plan="plano"))
+        files = FakeSandbox.instance.files.written
+        self.assertIn(f"{SKILLS_DEST_DIR}/systematic-debugging/SKILL.md", files)
+        self.assertIn(f"{SKILLS_DEST_DIR}/writing-plans/SKILL.md", files)
+        runs = FakeSandbox.instance.commands.runs
+        self.assertTrue(any(f"rm -rf {FIX_DIR}" in r["cmd"] for r in runs))
+        self.assertTrue(self.heartbeats)
+
+    async def test_analyze_failure_returns_question(self) -> None:
+        self.claude_writes({ANALYSIS_PATH: "causa", QUESTION_PATH: "Trocar o ORM?"})
+        result = await self.env.run(
+            self.activities.analyze_failure, AnalyzeRequest("sbx-1", ISSUE, "FAILED")
+        )
+        self.assertEqual(result, FixAnalysis(analysis="causa", question="Trocar o ORM?"))
+
+    async def test_analyze_failure_without_plan_or_question(self) -> None:
+        self.claude_writes({ANALYSIS_PATH: "causa"})
+        with self.assertRaises(ApplicationError):
+            await self.env.run(
+                self.activities.analyze_failure, AnalyzeRequest("sbx-1", ISSUE, "FAILED")
+            )
+
+    async def test_implement_fix_writes_plan_and_runs_claude(self) -> None:
+        self.claude_writes({})
+        result = await self.env.run(
+            self.activities.implement_fix, FixRequest("sbx-1", ISSUE, "causa", "plano")
+        )
+        files = FakeSandbox.instance.files.written
+        self.assertEqual(files[FIX_PLAN_PATH], "plano")
+        self.assertEqual(files[ANALYSIS_PATH], "causa")
+        self.assertIn(FIX_PROMPT_PATH, files)
+        self.assertEqual(result, "<texto do result>")
 
     async def test_kill_sandbox(self) -> None:
         await self.env.run(self.activities.kill_sandbox, "sbx-1")

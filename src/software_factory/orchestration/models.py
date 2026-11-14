@@ -78,11 +78,72 @@ class CommitImplementationRequest:
     identifier: str
     # Commit clonado de factory/<ID>: HEAD igual a ele = Claude não mudou nada.
     base_sha: str
+    # Vazio: "feat: implementa <ID>".
+    message: str = ""
+    # False: sem mudanças devolve a branch sem push (checkpoint opcional).
+    require_changes: bool = True
+
+
+@dataclass(frozen=True)
+class FixAttempt:
+    number: int
+    analysis: str
+    # Saída dos testes depois da correção.
+    test_output: str
+
+
+@dataclass(frozen=True)
+class Clarification:
+    question: str
+    answer: str
+
+
+@dataclass(frozen=True)
+class AnalyzeRequest:
+    sandbox_id: str
+    issue: PlanIssueInput
+    test_output: str
+    attempts: tuple[FixAttempt, ...] = ()
+    clarifications: tuple[Clarification, ...] = ()
+
+
+@dataclass(frozen=True)
+class FixAnalysis:
+    analysis: str
+    plan: str | None = None
+    # Preenchida = decisão grande; plan fica None.
+    question: str | None = None
+
+
+@dataclass(frozen=True)
+class FixRequest:
+    sandbox_id: str
+    issue: PlanIssueInput
+    analysis: str
+    plan: str
+    clarifications: tuple[Clarification, ...] = ()
+
+
+@dataclass(frozen=True)
+class CommentRequest:
+    issue_id: str
+    # UUID v4 gerado no workflow: idempotência.
+    comment_id: str
+    body: str
+
+
+@dataclass(frozen=True)
+class HumanAnswer:
+    # Id do comentário da pergunta (parentId do reply).
+    question_id: str
+    comment_id: str
+    body: str
 
 
 OUTCOME_PR_OPENED = "pr_opened"
 OUTCOME_NO_PLAN = "no_plan"
 OUTCOME_SKIPPED = "skipped"
+OUTCOME_STOPPED = "stopped"
 
 
 @dataclass(frozen=True)

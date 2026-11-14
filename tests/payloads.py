@@ -36,3 +36,23 @@ def issue_payload(
     if updated_from is not None:
         payload["updatedFrom"] = updated_from
     return payload
+
+
+def comment_payload(
+    parent_id: str | None = "question-1",
+    body: str = "Use bcrypt",
+    action: str = "create",
+    webhook_timestamp: int = 0,
+) -> dict[str, Any]:
+    return {
+        "action": action,
+        "type": "Comment",
+        "webhookTimestamp": webhook_timestamp,
+        "data": {
+            "id": "comment-1",
+            "body": body,
+            "issueId": "issue-uuid",
+            "parentId": parent_id,
+            "userId": "user-1",
+        },
+    }

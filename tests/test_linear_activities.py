@@ -8,7 +8,7 @@ from temporalio.testing import ActivityEnvironment
 
 from software_factory.linear.client import LinearClient
 from software_factory.orchestration.linear_activities import LinearActivities
-from software_factory.orchestration.models import MoveIssueRequest
+from software_factory.orchestration.models import CommentRequest, MoveIssueRequest
 
 TEAM_STATES = [
     {"id": "state-todo", "name": "To Do"},
@@ -121,6 +121,65 @@ class TestMoveIssue(unittest.IsolatedAsyncioTestCase):
                 issue_response("In Planning"),
                 {"data": {"issueUpdate": {"success": False}}},
             )
+
+
+class TestPostComment(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.requests: list[httpx.Request] = []
+        self.responses: list[dict[str, Any]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.requests.append(request)
+            return httpx.Response(200, json=self.responses.pop(0))
+
+        client = LinearClient("lin-key", transport=httpx.MockTransport(handler))
+        self.activities = LinearActivities(client)
+
+    async def run_post(self, request: CommentRequest, *responses: dict[str, Any]) -> str:
+        self.responses.extend(responses)
+        return await ActivityEnvironment().run(self.activities.post_comment, request)
+
+    def variables(self, index: int) -> dict[str, Any]:
+        return json.loads(self.requests[index].content)["variables"]
+
+    async def test_creates_comment(self) -> None:
+        result = await self.run_post(
+            CommentRequest("issue-1", "c-1", "Pergunta?"),
+            {"data": {"issue": {"comments": {"nodes": []}}}},
+            {"data": {"commentCreate": {"success": True, "comment": {"id": "c-1"}}}},
+        )
+        self.assertEqual(result, "c-1")
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(self.variables(0), {"issueId": "issue-1", "commentId": "c-1"})
+        self.assertEqual(
+            self.variables(1),
+            {"input": {"id": "c-1", "issueId": "issue-1", "body": "Pergunta?"}},
+        )
+
+    async def test_retry_after_create_is_noop(self) -> None:
+        result = await self.run_post(
+            CommentRequest("issue-1", "c-1", "Pergunta?"),
+            {"data": {"issue": {"comments": {"nodes": [{"id": "c-1"}]}}}},
+        )
+        self.assertEqual(result, "c-1")
+        self.assertEqual(len(self.requests), 1)
+
+    async def test_missing_issue_is_non_retryable(self) -> None:
+        with self.assertRaises(ApplicationError) as ctx:
+            await self.run_post(
+                CommentRequest("issue-1", "c-1", "Pergunta?"), {"data": {"issue": None}}
+            )
+        self.assertTrue(ctx.exception.non_retryable)
+        self.assertEqual(len(self.requests), 1)
+
+    async def test_unsuccessful_create_is_retryable(self) -> None:
+        with self.assertRaises(ApplicationError) as ctx:
+            await self.run_post(
+                CommentRequest("issue-1", "c-1", "Pergunta?"),
+                {"data": {"issue": {"comments": {"nodes": []}}}},
+                {"data": {"commentCreate": {"success": False, "comment": None}}},
+            )
+        self.assertFalse(ctx.exception.non_retryable)
 
 
 if __name__ == "__main__":
