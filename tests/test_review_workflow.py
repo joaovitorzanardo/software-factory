@@ -321,6 +321,21 @@ class TestReviewIssueWorkflow(unittest.IsolatedAsyncioTestCase):
         self.assertIn("https://linear.app/acme/issue/ENG-102", summary)
         self.assertEqual(self.count(fake, "create_issue"), 2)
 
+    async def test_issue_finding_repeated_in_later_round_is_not_recreated(self) -> None:
+        follow = finding("issue", "fora do escopo")
+        fake = FakeReviewActivities(
+            reports=[
+                ReviewReport("Follow-up e bug.", (follow, finding("fix", "bug"))),
+                ReviewReport("Só o follow-up.", (follow,)),
+            ]
+        )
+        result = await self.run_workflow(fake)
+        self.assertEqual(result.outcome, "merged")
+        self.assertEqual(self.count(fake, "create_issue"), 1)
+        self.assertEqual(result.follow_ups, ("ENG-101",))
+        # O resumo da segunda rodada ainda leva o link da issue já criada.
+        self.assertIn("https://linear.app/acme/issue/ENG-101", fake.comments[1].body)
+
     async def test_ask_finding_waits_for_answer_and_rereviews_with_clarification(self) -> None:
         fake = FakeReviewActivities(
             reports=[

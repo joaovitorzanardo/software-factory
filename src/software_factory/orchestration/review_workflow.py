@@ -48,7 +48,8 @@ def finding_where(f: ReviewFinding) -> str:
 
 
 def finding_key(f: ReviewFinding) -> str:
-    """Chave do achado em `follow_ups`; achados iguais na rodada viram uma issue só."""
+    """Chave do achado em `follow_ups`; achados iguais (na rodada ou em rodadas seguintes)
+    viram uma issue só."""
     return f"{finding_where(f)}:{f.title}"
 
 
@@ -144,6 +145,8 @@ class ReviewIssueWorkflow(SessionWorkflow):
         rounds: list[ReviewRound] = []
         fix_rounds = 0
         follow_ups: list[str] = []
+        # Follow-ups já criados, entre rodadas: a re-review que repete o achado reaproveita.
+        known_follow_ups: dict[str, FollowUpIssue] = {}
         while True:
             if not await self._still_in(issue, STATE_IN_REVIEW):
                 return self._stopped(issue, follow_ups)
@@ -174,8 +177,10 @@ class ReviewIssueWorkflow(SessionWorkflow):
             report, reviewed_sha = reviewed
             review_round = ReviewRound(number, report.summary, report.findings)
 
-            created = await self._create_follow_ups(issue, report)
-            follow_ups += [i.identifier for i in created.values()]
+            created = await self._create_follow_ups(issue, report, known_follow_ups)
+            follow_ups += [
+                i.identifier for i in created.values() if i.identifier not in follow_ups
+            ]
             await workflow.execute_activity(
                 "post_comment",
                 CommentRequest(
@@ -243,13 +248,19 @@ class ReviewIssueWorkflow(SessionWorkflow):
         return ReviewResult(issue.identifier, OUTCOME_STOPPED, follow_ups=tuple(follow_ups))
 
     async def _create_follow_ups(
-        self, issue: PlanIssueInput, report: ReviewReport
+        self, issue: PlanIssueInput, report: ReviewReport, known: dict[str, FollowUpIssue]
     ) -> dict[str, FollowUpIssue]:
+        """Follow-ups dos achados `issue` da rodada. Cria só as chaves que não estão em `known`
+        (que é atualizado); as já vistas reaproveitam a issue existente."""
         created: dict[str, FollowUpIssue] = {}
         for f in report.findings:
-            if f.decision != "issue" or finding_key(f) in created:
+            key = finding_key(f)
+            if f.decision != "issue" or key in created:
                 continue
-            created[finding_key(f)] = await workflow.execute_activity(
+            if key in known:
+                created[key] = known[key]
+                continue
+            created[key] = known[key] = await workflow.execute_activity(
                 "create_issue",
                 CreateIssueRequest(
                     origin_issue_id=issue.issue_id,
