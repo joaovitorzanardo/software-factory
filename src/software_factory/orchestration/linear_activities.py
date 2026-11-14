@@ -2,7 +2,7 @@ from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
 from software_factory.linear.client import LinearClient
-from software_factory.orchestration.models import MoveIssueRequest
+from software_factory.orchestration.models import CommentRequest, MoveIssueRequest
 
 ISSUE_STATES_QUERY = """
 query($id: String!) {
@@ -13,6 +13,18 @@ query($id: String!) {
 UPDATE_STATE_MUTATION = """
 mutation($id: String!, $stateId: String!) {
   issueUpdate(id: $id, input: {stateId: $stateId}) { success }
+}
+"""
+
+COMMENT_EXISTS_QUERY = """
+query($issueId: String!, $commentId: ID!) {
+  issue(id: $issueId) { comments(filter: {id: {eq: $commentId}}) { nodes { id } } }
+}
+"""
+
+COMMENT_CREATE_MUTATION = """
+mutation($input: CommentCreateInput!) {
+  commentCreate(input: $input) { success comment { id } }
 }
 """
 
@@ -64,3 +76,36 @@ class LinearActivities:
             raise ApplicationError(f"Linear não atualizou o status da issue {request.issue_id}")
         activity.logger.info("issue %s: %r → %r", request.issue_id, current, target["name"])
         return True
+
+    @activity.defn
+    async def post_comment(self, request: CommentRequest) -> str:
+        """Id do comentário; idempotente: se `comment_id` já existe, não cria de novo."""
+        data = await self.client.execute(
+            COMMENT_EXISTS_QUERY, {"issueId": request.issue_id, "commentId": request.comment_id}
+        )
+        issue = data.get("issue")
+        if issue is None:
+            raise ApplicationError(
+                f"issue {request.issue_id} não encontrada no Linear", non_retryable=True
+            )
+        # Retry depois de um comentário já criado: devolve o id sem mutation.
+        if issue["comments"]["nodes"]:
+            return request.comment_id
+
+        result = await self.client.execute(
+            COMMENT_CREATE_MUTATION,
+            {
+                "input": {
+                    "id": request.comment_id,
+                    "issueId": request.issue_id,
+                    "body": request.body,
+                }
+            },
+        )
+        created = result["commentCreate"]
+        if not created["success"]:
+            raise ApplicationError(f"Linear não criou o comentário na issue {request.issue_id}")
+        activity.logger.info(
+            "comentário %s criado na issue %s", request.comment_id, request.issue_id
+        )
+        return created["comment"]["id"]
