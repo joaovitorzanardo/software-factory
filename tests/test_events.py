@@ -1,8 +1,15 @@
 import unittest
 
 from software_factory.config import DEFAULT_TRIGGER_LABELS
-from software_factory.linear.events import parse_issue, should_implement, should_process
-from tests.payloads import BUG, DOCS, FEATURE, issue_payload
+from software_factory.linear.events import (
+    CommentReply,
+    parse_issue,
+    parse_reply,
+    should_implement,
+    should_process,
+)
+from software_factory.orchestration.models import HumanAnswer
+from tests.payloads import BUG, DOCS, FEATURE, comment_payload, issue_payload
 
 
 def process(payload) -> bool:
@@ -121,3 +128,21 @@ class TestParseIssue(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestParseReply(unittest.TestCase):
+    def test_parse_reply(self) -> None:
+        self.assertEqual(
+            parse_reply(comment_payload()),
+            CommentReply("issue-uuid", HumanAnswer("question-1", "comment-1", "Use bcrypt")),
+        )
+
+    def test_ignores_top_level_comment(self) -> None:
+        self.assertIsNone(parse_reply(comment_payload(parent_id=None)))
+
+    def test_ignores_empty_body(self) -> None:
+        self.assertIsNone(parse_reply(comment_payload(body="")))
+
+    def test_ignores_update_and_issue_events(self) -> None:
+        self.assertIsNone(parse_reply(comment_payload(action="update")))
+        self.assertIsNone(parse_reply(issue_payload(labels=[FEATURE])))
