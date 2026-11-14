@@ -12,18 +12,21 @@ from software_factory.orchestration.activities import SandboxActivities
 from software_factory.orchestration.github_activities import GitHubActivities
 from software_factory.orchestration.implement_workflow import ImplementIssueWorkflow
 from software_factory.orchestration.linear_activities import LinearActivities
+from software_factory.orchestration.review_activities import ReviewActivities
+from software_factory.orchestration.review_workflow import ReviewIssueWorkflow
 from software_factory.orchestration.workflow import PlanIssueWorkflow
 
 
 async def run_worker(settings: FactorySettings) -> None:
     client = await Client.connect(settings.temporal_address)
     activities = SandboxActivities(settings)
+    review = ReviewActivities(activities)
     linear = LinearActivities(LinearClient(settings.linear_api_key))
     github = GitHubActivities(GitHubClient(settings.github_token, settings.target_repo))
     worker = Worker(
         client,
         task_queue=settings.task_queue,
-        workflows=[PlanIssueWorkflow, ImplementIssueWorkflow],
+        workflows=[PlanIssueWorkflow, ImplementIssueWorkflow, ReviewIssueWorkflow],
         activities=[
             activities.create_sandbox,
             activities.clone_repo,
@@ -36,10 +39,15 @@ async def run_worker(settings: FactorySettings) -> None:
             activities.run_tests,
             activities.commit_implementation,
             activities.kill_sandbox,
+            review.review_pull,
+            review.implement_review_fix,
             linear.move_issue,
             linear.post_comment,
+            linear.create_issue,
             github.plan_exists,
             github.open_pull_request,
+            github.pull_request_info,
+            github.merge_pull_request,
         ],
     )
     logging.getLogger(__name__).info("worker ouvindo task queue %s", settings.task_queue)

@@ -6,6 +6,7 @@ from software_factory.linear.events import (
     parse_issue,
     parse_reply,
     should_implement,
+    should_review,
     should_process,
 )
 from software_factory.orchestration.models import HumanAnswer
@@ -113,6 +114,40 @@ class TestShouldImplement(unittest.TestCase):
         )
         self.assertTrue(process(payload))
         self.assertTrue(implement(payload))
+
+
+def review(payload) -> bool:
+    return should_review(payload, DEFAULT_TRIGGER_LABELS)
+
+
+class TestShouldReview(unittest.TestCase):
+    def test_should_review_on_in_review_with_label(self) -> None:
+        payload = issue_payload(
+            "update",
+            labels=[FEATURE],
+            updated_from={"stateId": "s-old"},
+            state={"id": "s3", "name": "in review"},
+        )
+        self.assertTrue(review(payload))
+        self.assertFalse(implement(payload))
+
+    def test_should_review_ignores_without_state_change(self) -> None:
+        payload = issue_payload(
+            "update",
+            labels=[FEATURE],
+            updated_from={"title": "Antigo"},
+            state={"id": "s3", "name": "In Review"},
+        )
+        self.assertFalse(review(payload))
+
+    def test_should_review_ignores_without_label(self) -> None:
+        payload = issue_payload(
+            "update",
+            labels=[DOCS],
+            updated_from={"stateId": "s-old"},
+            state={"id": "s3", "name": "In Review"},
+        )
+        self.assertFalse(review(payload))
 
 
 class TestParseIssue(unittest.TestCase):
