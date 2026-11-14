@@ -205,6 +205,8 @@ class ReviewRequest:
 class ReviewReport:
     summary: str
     findings: tuple[ReviewFinding, ...]
+    # Preenchido pela activity a partir do diff (não pelo LLM): exige confirmação do merge.
+    sensitive_files: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

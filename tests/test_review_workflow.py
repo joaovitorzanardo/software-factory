@@ -77,7 +77,10 @@ class FakeReviewActivities:
         pull_missing: bool = False,
         fail_review_times: int = 0,
         not_in_review: bool = False,
+        fixed_head: str | None = None,
     ) -> None:
+        # Head clonado sempre igual (ninguém empurrou entre as sessões).
+        self.fixed_head = fixed_head
         self.not_in_review = not_in_review
         # Relatório de cada rodada; esgotados, a review aprova.
         self.reports = list(reports or [])
@@ -129,7 +132,7 @@ class FakeReviewActivities:
     async def clone_branch(self, request: CloneBranchRequest) -> str:
         self.calls.append("clone_branch")
         self.clones += 1
-        return f"sha-{self.clones}"
+        return self.fixed_head or f"sha-{self.clones}"
 
     @activity.defn(name="review_pull")
     async def review_pull(self, request: ReviewRequest) -> ReviewReport:
@@ -445,6 +448,48 @@ class TestReviewIssueWorkflow(unittest.IsolatedAsyncioTestCase):
             fake.calls.index("merge_pull_request"),
             [i for i, c in enumerate(fake.calls) if c == "review_pull"][1],
         )
+
+    async def test_sensitive_files_ask_confirmation_before_merge(self) -> None:
+        fake = FakeReviewActivities(
+            reports=[ReviewReport("Tudo certo.", (), sensitive_files=("CLAUDE.md", "Makefile"))],
+            answers=["pode mergear"],
+        )
+        result = await self.run_workflow(fake)
+        self.assertEqual(result.outcome, "merged")
+        self.assertEqual(len(fake.questions), 1)
+        body = fake.questions[0].body
+        self.assertIn("CLAUDE.md", body)
+        self.assertIn("Makefile", body)
+        self.assertIn("sha-1", body)
+        question_at = fake.calls.index("post_comment") + 1
+        self.assertEqual(fake.calls[question_at], "post_comment")
+        self.assertLess(question_at, fake.calls.index("merge_pull_request"))
+        self.assertEqual(fake.merge_requests, [MergeRequest("ENG-12", ISSUE.title, 7, "sha-1")])
+
+    async def test_sensitive_files_confirmed_sha_is_not_asked_again(self) -> None:
+        sensitive = ReviewReport("Tudo certo.", (), sensitive_files=("CLAUDE.md",))
+        fake = FakeReviewActivities(
+            reports=[sensitive, sensitive],
+            merges=[MergeResult(False, reason="não mergeável (dirty)"), MergeResult(True)],
+            answers=["confirmo", "resolvi"],
+            fixed_head="sha-x",
+        )
+        result = await self.run_workflow(fake)
+        self.assertEqual(result.outcome, "merged")
+        # Confirmação do sha-x + merge bloqueado; a segunda review do mesmo sha não pergunta.
+        self.assertEqual(len(fake.questions), 2)
+        self.assertIn("CLAUDE.md", fake.questions[0].body)
+        self.assertIn("não mergeável", fake.questions[1].body)
+
+    async def test_stopped_while_confirming_sensitive_files_does_not_merge(self) -> None:
+        fake = FakeReviewActivities(
+            reports=[ReviewReport("Tudo certo.", (), sensitive_files=("CLAUDE.md",))],
+            stop_after_checks=1,
+        )
+        result = await self.run_workflow(fake)
+        self.assertEqual(result.outcome, "stopped")
+        self.assertEqual(len(fake.questions), 1)
+        self.assertNotIn("merge_pull_request", fake.calls)
 
     async def test_head_changed_since_review_rereviews(self) -> None:
         fake = FakeReviewActivities(merges=[MergeResult(False, head_changed=True)])

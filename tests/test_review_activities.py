@@ -141,6 +141,29 @@ class TestReviewActivities(unittest.IsolatedAsyncioTestCase):
             self.assertIn(path, written)
             self.assertNotIn("gh-token", written[path])
 
+    async def test_review_pull_flags_sensitive_files_before_claude(self) -> None:
+        self.claude_reviews()
+        FakeSandbox.instance.commands.responses = {
+            "git diff --name-only": "src/app.py\nCLAUDE.md\n.github/workflows/ci.yml\n"
+        }
+        report = await self.env.run(self.activities.review_pull, self.request)
+        self.assertEqual(report.sensitive_files, ("CLAUDE.md", ".github/workflows/ci.yml"))
+        runs = FakeSandbox.instance.commands.runs
+        cmds = [r["cmd"] for r in runs]
+        diff = next(i for i, c in enumerate(cmds) if "git diff --name-only" in c)
+        fetch = next(i for i, c in enumerate(cmds) if "git fetch --depth 1" in c)
+        first_claude = next(i for i, c in enumerate(cmds) if "claude -p" in c)
+        self.assertLess(fetch, diff)
+        self.assertLess(diff, first_claude)
+        self.assertIn(f"git diff --name-only {BASE_SHA} HEAD", cmds[diff])
+        self.assertEqual(runs[diff]["cwd"], REPO_DIR)
+
+    async def test_review_pull_without_sensitive_files(self) -> None:
+        self.claude_reviews()
+        FakeSandbox.instance.commands.responses = {"git diff --name-only": "src/app.py\n"}
+        report = await self.env.run(self.activities.review_pull, self.request)
+        self.assertEqual(report.sensitive_files, ())
+
     async def test_review_pull_rejects_unsafe_base_sha(self) -> None:
         self.claude_reviews()
         request = ReviewRequest(sandbox_id="sbx-1", issue=ISSUE, base_sha="main; rm -rf /")

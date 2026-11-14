@@ -1,6 +1,7 @@
 """Sessão de review no sandbox: lentes correctness/security em paralelo, triagem e correção."""
 
 import asyncio
+import dataclasses
 import re
 from e2b import FileNotFoundException
 from temporalio import activity
@@ -26,6 +27,7 @@ from software_factory.orchestration.review_prompts import (
     build_security_prompt,
     build_triage_prompt,
     parse_review,
+    sensitive_files,
 )
 
 CORRECTNESS_PROMPT_PATH = "/home/user/review-correctness-prompt.md"
@@ -82,6 +84,13 @@ class ReviewActivities:
             envs={"GITHUB_TOKEN": self.sandbox.settings.github_token},
             timeout=GIT_COMMAND_TIMEOUT_S,
         )
+        # Portão do orquestrador, antes de qualquer Claude: o código revisado não o controla.
+        diff = await sandbox.commands.run(
+            f"git diff --name-only {request.base_sha} HEAD",
+            cwd=REPO_DIR,
+            timeout=GIT_COMMAND_TIMEOUT_S,
+        )
+        sensitive = sensitive_files([p for p in diff.stdout.splitlines() if p.strip()])
         await sandbox.files.write(CORRECTNESS_PROMPT_PATH, build_correctness_prompt(request))
         await sandbox.files.write(SECURITY_PROMPT_PATH, build_security_prompt(request))
         await sandbox.files.write(TRIAGE_PROMPT_PATH, build_triage_prompt(request))
@@ -114,7 +123,7 @@ class ReviewActivities:
             raise ApplicationError(
                 f"Claude Code não salvou a triagem em {REVIEW_JSON_PATH}"
             ) from None
-        return parse_review(text)
+        return dataclasses.replace(parse_review(text), sensitive_files=sensitive)
 
     @activity.defn
     async def implement_review_fix(self, request: ReviewFixRequest) -> str:

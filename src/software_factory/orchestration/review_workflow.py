@@ -96,6 +96,17 @@ def asks_question(findings: list[ReviewFinding]) -> str:
     return f"A review da PR levantou {len(findings)} ponto(s) que precisam de decisão:\n\n{items}"
 
 
+def sensitive_files_question(pull: PullInfo, sha: str, files: tuple[str, ...]) -> str:
+    items = "\n".join(f"- `{path}`" for path in files)
+    return (
+        f"A review aprovou a PR {pull.url} (sha `{sha}`), mas ela muda arquivos sensíveis, que "
+        "alteram o comportamento do agente, da CI ou dos testes:\n\n"
+        f"{items}\n\n"
+        "Confira essas mudanças e responda nesta thread para eu fazer o merge deste sha. "
+        "O merge só acontece com a sua confirmação."
+    )
+
+
 def review_stuck_question(n: int, last_round: ReviewRound) -> str:
     items = "\n".join(
         f"- [{f.lens}/{f.severity}] `{f.decision}` `{finding_where(f)}`: {f.title}"
@@ -149,6 +160,8 @@ class ReviewIssueWorkflow(SessionWorkflow):
         follow_ups: list[str] = []
         # Follow-ups já criados, entre rodadas: a re-review que repete o achado reaproveita.
         known_follow_ups: dict[str, FollowUpIssue] = {}
+        # Shas com arquivos sensíveis cujo merge a pessoa já confirmou: não pergunta de novo.
+        confirmed_shas: list[str] = []
         while True:
             if not await self._still_in(issue, STATE_IN_REVIEW):
                 return self._stopped(issue, follow_ups)
@@ -217,6 +230,16 @@ class ReviewIssueWorkflow(SessionWorkflow):
                 continue
 
             rounds.append(review_round)
+            if report.sensitive_files and reviewed_sha not in confirmed_shas:
+                label = (
+                    f"Confirmar o merge de {reviewed_sha[:12]} com "
+                    f"{len(report.sensitive_files)} arquivo(s) sensível(is)"
+                )
+                question = sensitive_files_question(pull, reviewed_sha, report.sensitive_files)
+                if not await self._ask(issue, question, STATE_IN_REVIEW, label=label):
+                    return self._stopped(issue, follow_ups)
+                # A resposta confirma o merge deste sha; para parar, a pessoa move a issue.
+                confirmed_shas.append(reviewed_sha)
             merge: MergeResult = await workflow.execute_activity(
                 "merge_pull_request",
                 MergeRequest(issue.identifier, issue.title, pull.number, reviewed_sha),

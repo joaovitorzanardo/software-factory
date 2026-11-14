@@ -30,6 +30,21 @@ CORRECTNESS_PATH = f"{REVIEW_DIR}/correctness.md"
 SECURITY_PATH = f"{REVIEW_DIR}/security.md"
 REVIEW_JSON_PATH = f"{REVIEW_DIR}/review.json"
 FINDING_DETAIL_CAP = 1000
+# Arquivos que mudam o comportamento do agente, da CI ou dos testes: o código revisado pode
+# controlar o revisor por eles, então a aprovação deles pede confirmação humana antes do merge.
+# Terminado em "/" = diretório (em qualquer nível); senão, nome de arquivo em qualquer diretório.
+SENSITIVE_PATTERNS = (
+    "CLAUDE.md",
+    ".claude/",
+    ".github/workflows/",
+    "pytest.ini",
+    "tox.ini",
+    "setup.cfg",
+    "pyproject.toml",
+    "conftest.py",
+    ".pre-commit-config.yaml",
+    "Makefile",
+)
 
 _FINDING_FIELDS = ("lens", "severity", "file", "line", "title", "detail", "decision", "reason")
 
@@ -51,6 +66,21 @@ _TRIAGE_RULES = """- `fix`: o problema foi confirmado no código, é `critical` 
 - Achado `minor` nunca vira `fix`.
 - Achado de `security` `critical` nunca vira `note` nem `issue`: ou `fix`, ou `ask`, ou `reject`
   com a prova em `reason`."""
+
+
+def _is_sensitive(path: str) -> bool:
+    for pattern in SENSITIVE_PATTERNS:
+        if pattern.endswith("/"):
+            if path.startswith(pattern) or f"/{pattern}" in path:
+                return True
+        elif path == pattern or path.endswith(f"/{pattern}"):
+            return True
+    return False
+
+
+def sensitive_files(paths: list[str]) -> tuple[str, ...]:
+    """Arquivos do diff que casam com SENSITIVE_PATTERNS, na ordem do diff."""
+    return tuple(p for p in paths if _is_sensitive(p))
 
 
 def _review_context(request: ReviewRequest) -> str:
@@ -101,8 +131,9 @@ def build_security_prompt(request: ReviewRequest) -> str:
 
 
 def _finding_line(f: ReviewFinding) -> str:
+    # Título, detalhe, motivo e resumo vêm do LLM (e do código revisado): sempre cercados.
     where = f"{f.file}:{f.line}" if f.line is not None else f.file
-    return f"[{f.lens}/{f.severity}] `{where}`: {f.title}"
+    return f"[{f.lens}/{f.severity}] `{where}`, título:\n\n{_fence(f.title)}"
 
 
 def _history_section(history: tuple[ReviewRound, ...]) -> str:
@@ -110,12 +141,14 @@ def _history_section(history: tuple[ReviewRound, ...]) -> str:
         return ""
     rounds = []
     for r in history:
-        items = "\n".join(
-            f"- {_finding_line(f)} → `{f.decision}` ({f.reason})" for f in r.findings
+        items = "\n\n".join(
+            f"- {_finding_line(f)}\n\n  Decisão: `{f.decision}`, motivo:\n\n{_fence(f.reason)}"
+            for f in r.findings
         )
         notes = f"\n\nResumo da correção:\n\n{_fence(r.fix_notes)}" if r.fix_notes else ""
         rounds.append(
-            f"### Rodada {r.number}\n\n{r.summary}\n\n{items or '- (sem achados)'}{notes}"
+            f"### Rodada {r.number}\n\nResumo:\n\n{_fence(r.summary)}\n\n"
+            f"{items or '- (sem achados)'}{notes}"
         )
     return "## Rodadas anteriores\n\n" + "\n\n".join(rounds) + "\n\n"
 
@@ -154,7 +187,8 @@ def build_triage_prompt(request: ReviewRequest) -> str:
 
 def build_review_fix_prompt(request: ReviewFixRequest, test_command: str) -> str:
     items = "\n\n".join(
-        f"### Achado {i}: {_finding_line(f)}\n\n{f.detail}\n\nPor que corrigir: {f.reason}"
+        f"### Achado {i}: {_finding_line(f)}\n\nDetalhe:\n\n{_fence(f.detail)}\n\n"
+        f"Por que corrigir:\n\n{_fence(f.reason)}"
         for i, f in enumerate(request.findings, start=1)
     )
     return f"""Corrija os achados da review (rodada {request.round}) da PR da issue abaixo.
