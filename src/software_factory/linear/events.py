@@ -2,7 +2,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
-from software_factory.orchestration.models import STATE_IN_PROGRESS, HumanAnswer
+from software_factory.orchestration.models import STATE_IN_PROGRESS, STATE_IN_REVIEW, HumanAnswer
 
 
 @dataclass(frozen=True)
@@ -52,17 +52,27 @@ def should_process(payload: dict[str, Any], trigger_labels: Iterable[str]) -> bo
     return False
 
 
-def should_implement(payload: dict[str, Any], trigger_labels: Iterable[str]) -> bool:
-    """Issue com label de gatilho cujo status acabou de mudar para In Progress."""
+def _entered_state(payload: dict[str, Any], trigger_labels: Iterable[str], state: str) -> bool:
+    """Issue com label de gatilho cujo status acabou de mudar para `state`."""
     if payload.get("type") != "Issue" or payload.get("action") != "update":
         return False
     if "stateId" not in (payload.get("updatedFrom") or {}):
         return False
     data = payload.get("data") or {}
-    state = data.get("state") or {}
-    if str(state.get("name", "")).lower() != STATE_IN_PROGRESS.lower():
+    current = data.get("state") or {}
+    if str(current.get("name", "")).lower() != state.lower():
         return False
     return bool(_trigger_label_ids(data, trigger_labels))
+
+
+def should_implement(payload: dict[str, Any], trigger_labels: Iterable[str]) -> bool:
+    """Issue com label de gatilho cujo status acabou de mudar para In Progress."""
+    return _entered_state(payload, trigger_labels, STATE_IN_PROGRESS)
+
+
+def should_review(payload: dict[str, Any], trigger_labels: Iterable[str]) -> bool:
+    """Issue com label de gatilho cujo status acabou de mudar para In Review."""
+    return _entered_state(payload, trigger_labels, STATE_IN_REVIEW)
 
 
 def parse_issue(payload: dict[str, Any]) -> LinearIssue:

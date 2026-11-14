@@ -10,13 +10,15 @@ O caminho completo que queremos automatizar é:
 1. alguém cria uma issue no Linear descrevendo uma funcionalidade ou um bug;
 2. a fábrica escreve um **plano** de como resolver;
 3. a fábrica **implementa** o plano;
-4. a fábrica abre um **Pull Request** no GitHub para uma pessoa revisar.
+4. a fábrica abre um **Pull Request** no GitHub, revisa o código, corrige o que for preciso e faz o merge.
 
 Hoje (fase de teste) a fábrica faz as quatro etapas: ela recebe a issue, escreve o plano e salva
 esse plano numa branch do repositório; quando a issue entra em `In Progress`, implementa o plano,
 roda os testes e, se ficarem vermelhos, entra num loop de análise e correção até ficarem verdes;
-só então abre o PR e move a issue para `In Review`. Dúvidas grandes viram comentário na issue, e a
-resposta é um reply nesse comentário.
+só então abre o PR e move a issue para `In Review`. Em `In Review`, revisa a PR, corrige o que a
+review apontar e, aprovada, faz o merge **sem humano** (salvo arquivos sensíveis, que pedem
+confirmação) e move a issue para `Done`. Dúvidas grandes viram comentário na issue, e a resposta é
+um reply nesse comentário.
 
 Quem faz o trabalho "inteligente" é o **Claude Code**, rodando dentro de uma máquina isolada e
 descartável (sandbox do **E2B**). Quem coordena os passos, tenta de novo quando algo falha e
@@ -165,6 +167,46 @@ comentário na issue e espera; **responda com um reply na thread desse comentár
 conferido antes de cada tentativa e a cada hora durante a espera); nesse caso termina sem PR.
 Qualquer outra falha (sandbox, clone, push, a implementação inicial) deixa a issue em `In Progress`.
 
+Quando a issue entra em `In Review` (movida pelo `ImplementIssueWorkflow` ou por uma pessoa), o
+`ReviewIssueWorkflow` (id `review-issue-<issue id>`) revisa a PR `factory/<IDENTIFIER>`:
+
+1. cria um sandbox e roda primeiro o `TEST_COMMAND` no head clonado; vermelho (checkpoint `wip`,
+   push de uma pessoa...) entra no loop de correção, conta rodada e a review recomeça, então nada
+   vermelho é revisado nem mergeado;
+2. com os testes verdes, roda **em paralelo** duas lentes só de leitura sobre o diff inteiro da PR:
+   `correctness` (skill `requesting-code-review`) e `security`; depois uma triagem com a skill
+   `receiving-code-review`, que decide cada achado: `fix`, `issue`, `note`, `reject` ou `ask`;
+3. achado `minor` nunca vira `fix` (só `note`, `issue` ou `reject`), então o loop converge;
+4. `issue` cria uma issue de follow-up no Linear **sem** label de gatilho (a pessoa adiciona
+   `Feature`/`Bug` se quiser que a fábrica pegue), sem repetir a mesma issue entre rodadas;
+5. cada rodada posta um comentário de resumo na issue;
+6. com `fix`, uma sessão de correção roda os testes, faz push e começa nova rodada;
+7. sem `fix`, faz o merge **squash** da PR usando o sha revisado, **sem humano**, e move a issue
+   para `Done` (se o head mudou desde a review, revisa de novo, e isso conta rodada). A branch
+   `factory/<IDENTIFIER>` não é apagada.
+
+**Arquivos sensíveis:** se o diff da PR muda `CLAUDE.md` (em qualquer diretório), qualquer coisa sob `.claude/`, `.github/workflows/`, `pytest.ini`, `tox.ini`, `setup.cfg`, `pyproject.toml`, `conftest.py`, `.pre-commit-config.yaml` e `Makefile`, o merge só acontece depois de uma pessoa
+confirmar com um reply na pergunta que o workflow posta (uma vez por sha revisado). A lista é
+calculada pelo orquestrador com `git diff --name-only`, antes de qualquer Claude, porque esses
+arquivos podem mudar o comportamento do próprio revisor, da CI ou dos testes.
+
+Depois de 3 rodadas (`MAX_REVIEW_ROUNDS`) sem merge (correção, review que falhou, testes
+vermelhos antes da review ou head que mudou antes do merge), ou se a PR não puder ser mergeada
+(conflito, branch protection), o workflow pergunta no Linear (**reply na thread**, 7 dias). Para
+parar, mova a issue para fora de `In Review`.
+
+Requisitos e ressalvas da review:
+
+- O time do Linear precisa do status `Done`.
+- O token do GitHub precisa poder fazer merge: **Contents** e **Pull requests: Read and write**,
+  que já são necessários.
+- Branch protection que exige aprovação **bloqueia o merge**, porque o autor da PR é o dono do
+  token. Nesse caso o workflow pergunta; aprove ou ajuste a regra.
+- Sugestão: ative "Automatically delete head branches" no repo alvo, já que a fábrica não apaga
+  `factory/<IDENTIFIER>`.
+- Ainda não validado em sandbox E2B real: os dois processos `claude` das lentes rodam ao mesmo
+  tempo e compartilham `~/.claude`.
+
 ## Executar (servidor de webhooks)
 
 ```bash
@@ -198,9 +240,9 @@ No Linear: **Settings → API → Webhooks → New webhook**
 O endpoint valida a assinatura (`Linear-Signature`, 401 se inválida) e o
 `webhookTimestamp` (400 se tiver mais de 60s). Com label `Feature`/`Bug`, issues **criadas**
 ou **atualizadas** recebendo uma dessas labels iniciam o planejamento, e issues cujo status
-**mudou para `In Progress`** iniciam a implementação (se o mesmo evento adiciona a label e muda
+**mudou para `In Progress`** iniciam a implementação e para **`In Review`** iniciam a review (se o mesmo evento adiciona a label e muda
 o status, vale só o planejamento). Comentários criados como **reply** numa thread viram o signal `human_answer` do workflow de
-implementação da issue (`accepted`, ou `ignored` se não houver um rodando). Os demais eventos
+implementação ou de review da issue (`accepted`, ou `ignored` se não houver um rodando). Os demais eventos
 retornam 200 `{"status": "ignored"}`.
 Issues aceitas iniciam o workflow (`{"status": "accepted"}`, ou `"duplicate"` se já houver um
 rodando para a issue);

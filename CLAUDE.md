@@ -32,6 +32,8 @@ Software factory experimental (fase de teste). O objetivo é automatizar o ciclo
   no sandbox depois da implementação; exit 0 = verde. A PR só abre com verde.
 - **Linear API:** só GraphQL (`https://api.linear.app/graphql`, não há REST), chamada com `httpx`
   puro (`linear/client.py`, sem SDK); personal API key em `LINEAR_API_KEY` (worker), com escrita em issues.
+- **Review:** skills `requesting-code-review` (lente `correctness`) e `receiving-code-review` (triagem) do
+  superpowers 7.0.2, vendorizadas ao lado (MIT); a lente `security` usa prompt próprio.
 - **Planejamento:** skill `writing-plans` do superpowers 7.0.0, vendorizada em
   `orchestration/skills/` (MIT) e copiada para `~/.claude/skills/` no sandbox — sem instalar plugin via rede.
 - **Correção de testes vermelhos:** skill `systematic-debugging` do superpowers 7.0.2, vendorizada
@@ -51,10 +53,10 @@ src/software_factory/
   linear/
     client.py         # LinearClient: POST GraphQL com httpx; erros → ApplicationError (retentável ou não)
     signature.py      # validação HMAC do Linear-Signature + anti-replay
-    events.py         # LinearIssue, should_process (filtro por label), parse_issue,
+    events.py         # LinearIssue, should_process (filtro por label), should_implement/should_review, parse_issue,
                       # CommentReply e parse_reply (reply de comentário → HumanAnswer)
-    webhook.py        # POST /webhooks/linear; handle_issue inicia o PlanIssueWorkflow ou o ImplementIssueWorkflow;
-                      # handle_reply envia o signal human_answer ao ImplementIssueWorkflow
+    webhook.py        # POST /webhooks/linear; handle_issue inicia o PlanIssueWorkflow, o ImplementIssueWorkflow ou o
+                      # ReviewIssueWorkflow; handle_reply envia o signal human_answer aos workflows de implementação e review
   github/
     client.py         # GitHubClient: REST com httpx (default_branch, get_file, find_open_pull, create_pull)
   orchestration/
@@ -66,13 +68,18 @@ src/software_factory/
     activities.py     # SandboxActivities: create_sandbox, clone_repo, generate_plan, commit_plan,
                       # clone_branch, implement_plan, analyze_failure, implement_fix, run_tests,
                       # commit_implementation, kill_sandbox; install_skills (copia orchestration/skills/)
-    linear_activities.py  # LinearActivities: move_issue (muda o status por nome, no time da issue) e
-                          # post_comment (idempotente, com UUID gerado pelo cliente)
-    github_activities.py  # GitHubActivities: plan_exists, open_pull_request
+    linear_activities.py  # LinearActivities: move_issue (muda o status por nome, no time da issue),
+                          # post_comment e create_issue (idempotentes, com UUID gerado pelo cliente)
+    review_activities.py  # ReviewActivities(sandbox): review_pull (duas lentes + triagem), implement_review_fix
+    review_prompts.py     # prompts da review, parse_review, REVIEW_DIR, FINDING_DETAIL_CAP,
+                          # SENSITIVE_PATTERNS e sensitive_files
+    sessions.py       # SessionWorkflow: base compartilhada (sessões, perguntas, espera de resposta) do implement e do review
+    github_activities.py  # GitHubActivities: plan_exists, pull_request_info, open_pull_request, merge_pull_request
     workflow.py       # PlanIssueWorkflow: In Planning → sandbox → clone → plano → commit → kill (finally) → In Progress
     implement_workflow.py # ImplementIssueWorkflow: plano existe? → sandbox → clone da branch → implementa →
                       # testes → (verde: push → PR → In Review; vermelho: loop analisar → planejar → corrigir)
-    skills/writing-plans/, skills/systematic-debugging/  # vendorizadas do superpowers (SKILL.md + LICENSE)
+    review_workflow.py # ReviewIssueWorkflow: In Review → review → corrige em loop → follow-ups → merge squash → Done
+    skills/writing-plans/, skills/systematic-debugging/, skills/requesting-code-review/, skills/receiving-code-review/  # vendorizadas do superpowers (SKILL.md + LICENSE)
     worker.py         # entrypoint `software-factory-worker`
 tests/                # unittest; payloads.py tem fixtures no formato do Linear
 ```
@@ -84,13 +91,18 @@ tests/                # unittest; payloads.py tem fixtures no formato do Linear
 - Gatilho da implementação: `update` com `stateId` em `updatedFrom` e `data.state.name ==
   "In Progress"` (case-insensitive), em issue com label de gatilho. Evento que adiciona a label
   **e** muda o status dispara só o planejamento.
+- Gatilho da review: `update` com `stateId` em `updatedFrom` e `data.state.name == "In Review"`
+  (case-insensitive), em issue com label de gatilho. Ordem de despacho: planejamento > implementação > review.
+  Inicia o `ReviewIssueWorkflow` com id `review-issue-<issue.id>`.
 - Gatilho da resposta: `Comment` `create` com `parentId` (reply na thread) numa issue; `handle_reply`
-  envia o signal `human_answer` ao workflow `implement-issue-<issue.id>` (`{"status": "accepted"}`);
-  sem workflow rodando (`NOT_FOUND`) ou comentário fora de thread → `ignored`; outro erro → 503.
+  envia o signal `human_answer` aos workflows `implement-issue-<issue.id>` **e** `review-issue-<issue.id>`,
+  ignorando `NOT_FOUND` em cada um (o que não tem pergunta pendente ignora o signal); algum aceitou →
+  `{"status": "accepted"}`; nenhum rodando ou comentário fora de thread → `ignored`; outro erro → 503.
   O webhook do Linear precisa dos recursos **Issues** e **Comments**.
 - Eventos ignorados retornam 200 para o Linear não reenviar.
 - `handle_issue` inicia o `PlanIssueWorkflow` com id `plan-issue-<issue.id>` (ou o
-  `ImplementIssueWorkflow` com id `implement-issue-<issue.id>`); se já houver um rodando responde
+  `ImplementIssueWorkflow` com id `implement-issue-<issue.id>`, ou o `ReviewIssueWorkflow` com id
+  `review-issue-<issue.id>`); se já houver um rodando responde
   `{"status": "duplicate"}`; se o Temporal estiver fora, 503 (o Linear reenvia).
 - O workflow hoje **gera o plano** com a skill `writing-plans` e o **commita** em
   `docs/superpowers/plans/<IDENTIFIER>.md` na branch `factory/<IDENTIFIER>` (push feito pela
@@ -127,6 +139,31 @@ tests/                # unittest; payloads.py tem fixtures no formato do Linear
   tentativa e, na espera, a cada `ANSWER_POLL_INTERVAL = 1h` (retry ilimitado,
   `STATUS_CHECK_RETRY`); resultado `OUTCOME_STOPPED`, sem PR. Falha inesperada: sem compensação,
   issue fica em `In Progress`.
+- **Review (`ReviewIssueWorkflow`, `In Review`):** exige PR aberta de `factory/<ID>` e o status `Done`
+  no time (validado no início). Cada rodada, em um sandbox, roda primeiro `TEST_COMMAND` (`run_tests`,
+  12 min, sem retry) no head clonado: vermelho mata o sandbox, entra no `_fix_until_green`, conta
+  rodada e volta à review (nada vermelho é revisado nem mergeado). Verde: roda em paralelo as lentes `correctness`
+  (`requesting-code-review`) e `security` (dois `claude -p` só leitura) sobre o diff inteiro da PR
+  (merge-base → head, com o histórico das rodadas anteriores no prompt) e depois a triagem com
+  `receiving-code-review`, que decide por achado: `fix` (bloqueia o merge), `issue` (follow-up no
+  Linear), `note` (só no resumo), `reject` (falso positivo, com razão) ou `ask` (decisão grande,
+  vira pergunta). Achado `minor` nunca vira `fix` (o loop converge). Follow-ups são criados **sem**
+  label de gatilho (não encadeiam planejamento → implementação → review) e deduplicados entre
+  rodadas. Cada rodada posta um comentário de resumo no Linear. Com `fix`, uma sessão de correção
+  (+ `run_tests`, commit e push) e nova rodada. Sem `fix`: merge squash da PR **sem humano** com
+  `sha` = commit revisado; se o head mudou desde a review (`head_changed`), revisa de novo sem
+  perguntar, e isso conta rodada. **Arquivos sensíveis:** `review_pull` calcula, antes de qualquer
+  Claude, `git diff --name-only <base_sha> HEAD` filtrado por `SENSITIVE_PATTERNS`
+  (`review_prompts.py`: `CLAUDE.md` (em qualquer diretório), qualquer coisa sob `.claude/`, `.github/workflows/`, `pytest.ini`, `tox.ini`, `setup.cfg`, `pyproject.toml`, `conftest.py`, `.pre-commit-config.yaml` e `Makefile`) em `ReviewReport.sensitive_files`; se não estiver vazio, a review
+  aprovada pergunta no Linear antes do merge e a resposta confirma o merge daquele sha (não pergunta
+  de novo pelo mesmo sha). Título, detalhe, motivo e resumo vindos do LLM vão cercados (`_fence`) nos
+  prompts. Follow-ups: chave `lens + file + title` (sem a linha), título limitado a 200 caracteres. PR que não pode ser mergeada
+  (conflito, branch protection) vira pergunta no Linear com o motivo, e a resposta reinicia a review.
+  Depois de `MAX_REVIEW_ROUNDS = 3` rodadas seguidas sem merge (correção, sessão de review que
+  falha, testes vermelhos antes da review e `head_changed` contam)
+  o workflow pergunta como seguir; a resposta zera o contador. Parar: mover a issue para fora de
+  `In Review` (checado antes de cada rodada e na espera; `OUTCOME_STOPPED`, sem merge). Merge feito:
+  issue vai para `Done`. A branch `factory/<ID>` não é apagada.
 - Status no Linear: o workflow começa movendo a issue `To Do → In Planning` (só se estiver em
   `To Do`; senão planeja sem mover) e, depois do commit do plano e do kill do sandbox, move para
   `In Progress`. Status procurados por nome (case-insensitive) no time da issue; status inexistente

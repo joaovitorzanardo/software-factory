@@ -2,7 +2,7 @@ import json
 import os
 import unittest
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 from unittest import mock
 
 from e2b import CommandExitException, FileNotFoundException, TimeoutException
@@ -73,10 +73,14 @@ class FakeCommands:
     # substring do comando -> (stdout, stderr, exit_code): levanta CommandExitException.
     fail: dict[str, tuple[str, str, int]] = field(default_factory=dict)
     on_run: Callable[[str], None] | None = None
+    # Awaited antes de responder: deixa o teste observar comandos concorrentes.
+    hook: Callable[[str], Awaitable[None]] | None = None
     runs: list[dict[str, Any]] = field(default_factory=list)
 
     async def run(self, cmd: str, **kwargs: Any) -> FakeResult:
         self.runs.append({"cmd": cmd, **kwargs})
+        if self.hook:
+            await self.hook(cmd)
         failure = next((out for key, out in self.fail.items() if key in cmd), None)
         if failure:
             stdout, stderr, exit_code = failure

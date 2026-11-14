@@ -2,7 +2,12 @@ from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
 from software_factory.linear.client import LinearClient
-from software_factory.orchestration.models import CommentRequest, MoveIssueRequest
+from software_factory.orchestration.models import (
+    CommentRequest,
+    CreateIssueRequest,
+    FollowUpIssue,
+    MoveIssueRequest,
+)
 
 ISSUE_STATES_QUERY = """
 query($id: String!) {
@@ -25,6 +30,24 @@ query($issueId: String!, $commentId: ID!) {
 COMMENT_CREATE_MUTATION = """
 mutation($input: CommentCreateInput!) {
   commentCreate(input: $input) { success comment { id } }
+}
+"""
+
+ISSUE_EXISTS_QUERY = """
+query($id: ID!) {
+  issues(filter: {id: {eq: $id}}) { nodes { identifier url } }
+}
+"""
+
+ISSUE_TEAM_QUERY = """
+query($originId: String!) {
+  issue(id: $originId) { team { id } }
+}
+"""
+
+ISSUE_CREATE_MUTATION = """
+mutation($input: IssueCreateInput!) {
+  issueCreate(input: $input) { success issue { identifier url } }
 }
 """
 
@@ -109,3 +132,44 @@ class LinearActivities:
             "comentário %s criado na issue %s", request.comment_id, request.issue_id
         )
         return created["comment"]["id"]
+
+    @activity.defn
+    async def create_issue(self, request: CreateIssueRequest) -> FollowUpIssue:
+        """Follow-up no time da issue de origem; idempotente pelo id gerado pelo cliente.
+
+        Criada sem labels: as de gatilho (Feature/Bug) fariam a factory iniciar nela sozinha.
+        """
+        existing = await self.client.execute(ISSUE_EXISTS_QUERY, {"id": request.new_issue_id})
+        nodes = existing["issues"]["nodes"]
+        # Retry depois de uma issue já criada: devolve a existente sem mutation.
+        if nodes:
+            return FollowUpIssue(identifier=nodes[0]["identifier"], url=nodes[0]["url"])
+
+        data = await self.client.execute(ISSUE_TEAM_QUERY, {"originId": request.origin_issue_id})
+        origin = data.get("issue")
+        if origin is None:
+            raise ApplicationError(
+                f"issue {request.origin_issue_id} não encontrada no Linear", non_retryable=True
+            )
+
+        result = await self.client.execute(
+            ISSUE_CREATE_MUTATION,
+            {
+                "input": {
+                    "id": request.new_issue_id,
+                    "teamId": origin["team"]["id"],
+                    "title": request.title,
+                    "description": request.description,
+                }
+            },
+        )
+        created = result["issueCreate"]
+        if not created["success"]:
+            raise ApplicationError(
+                f"Linear não criou o follow-up da issue {request.origin_issue_id}"
+            )
+        issue = created["issue"]
+        activity.logger.info(
+            "follow-up %s criado a partir da issue %s", issue["identifier"], request.origin_issue_id
+        )
+        return FollowUpIssue(identifier=issue["identifier"], url=issue["url"])

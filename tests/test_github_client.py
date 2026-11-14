@@ -47,7 +47,8 @@ class TestGitHubClient(unittest.IsolatedAsyncioTestCase):
         requests: list[httpx.Request] = []
         url = "https://github.com/acme/app/pull/7"
         client = make_client(httpx.Response(200, json=[{"html_url": url}]), requests)
-        self.assertEqual(await client.find_open_pull("factory/ENG-12"), url)
+        pull = await client.find_open_pull("factory/ENG-12")
+        self.assertEqual(pull, {"html_url": url})
         request = requests[0]
         self.assertEqual(request.url.path, "/repos/acme/app/pulls")
         self.assertEqual(request.url.params["head"], "acme:factory/ENG-12")
@@ -55,6 +56,56 @@ class TestGitHubClient(unittest.IsolatedAsyncioTestCase):
 
         client = make_client(httpx.Response(200, json=[]), [])
         self.assertIsNone(await client.find_open_pull("factory/ENG-12"))
+
+    async def test_find_open_pull_returns_pull(self) -> None:
+        pull = {"html_url": "https://github.com/acme/app/pull/7", "number": 7}
+        client = make_client(httpx.Response(200, json=[pull]), [])
+        self.assertEqual(await client.find_open_pull("factory/ENG-12"), pull)
+
+    async def test_get_pull(self) -> None:
+        requests: list[httpx.Request] = []
+        client = make_client(httpx.Response(200, json={"number": 7, "merged": False}), requests)
+        self.assertEqual(await client.get_pull(7), {"number": 7, "merged": False})
+        self.assertEqual(requests[0].url.path, "/repos/acme/app/pulls/7")
+
+    async def test_merge_base(self) -> None:
+        requests: list[httpx.Request] = []
+        client = make_client(
+            httpx.Response(200, json={"merge_base_commit": {"sha": "base123"}}), requests
+        )
+        self.assertEqual(await client.merge_base("main", "abc"), "base123")
+        self.assertEqual(requests[0].url.path, "/repos/acme/app/compare/main...abc")
+
+    async def test_merge_pull_ok(self) -> None:
+        requests: list[httpx.Request] = []
+        client = make_client(httpx.Response(200, json={"merged": True}), requests)
+        self.assertEqual(await client.merge_pull(7, "abc", "ENG-12: t (#7)"), (True, ""))
+        request = requests[0]
+        self.assertEqual(request.method, "PUT")
+        self.assertEqual(request.url.path, "/repos/acme/app/pulls/7/merge")
+        body = json.loads(request.content)
+        self.assertEqual(body["merge_method"], "squash")
+        self.assertEqual(body["sha"], "abc")
+        self.assertEqual(body["commit_title"], "ENG-12: t (#7)")
+
+    async def test_merge_pull_not_mergeable(self) -> None:
+        client = make_client(
+            httpx.Response(405, json={"message": "Pull Request is not mergeable"}), []
+        )
+        self.assertEqual(
+            await client.merge_pull(7, "abc", "t"), (False, "Pull Request is not mergeable")
+        )
+
+    async def test_merge_pull_head_mismatch(self) -> None:
+        msg = "Head branch was modified. Review and try the merge again."
+        client = make_client(httpx.Response(409, json={"message": msg}), [])
+        self.assertEqual(await client.merge_pull(7, "abc", "t"), (False, msg))
+
+    async def test_merge_pull_other_errors_go_through_check(self) -> None:
+        client = make_client(httpx.Response(422, json={"message": "Validation Failed"}), [])
+        with self.assertRaises(ApplicationError) as ctx:
+            await client.merge_pull(7, "abc", "t")
+        self.assertTrue(ctx.exception.non_retryable)
 
     async def test_create_pull(self) -> None:
         requests: list[httpx.Request] = []

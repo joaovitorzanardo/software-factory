@@ -11,6 +11,7 @@ from software_factory.api import create_app
 from software_factory.config import Settings
 from software_factory.orchestration.implement_workflow import ImplementIssueWorkflow
 from software_factory.orchestration.models import HumanAnswer
+from software_factory.orchestration.review_workflow import ReviewIssueWorkflow
 from software_factory.orchestration.workflow import PlanIssueWorkflow
 from tests.payloads import DOCS, FEATURE, comment_payload, issue_payload
 from tests.test_signature import SECRET, sign
@@ -26,6 +27,7 @@ class FakeTemporalClient:
         self.started: list[tuple[tuple, dict]] = []
         self.signals: list[tuple[str, object, object]] = []
         self.signal_error: Exception | None = None
+        self.signal_errors: dict[str, Exception] = {}
 
     def get_workflow_handle(self, workflow_id: str) -> "FakeHandle":
         return FakeHandle(self, workflow_id)
@@ -44,6 +46,8 @@ class FakeHandle:
     async def signal(self, signal, arg) -> None:
         if self.client.signal_error:
             raise self.client.signal_error
+        if self.workflow_id in self.client.signal_errors:
+            raise self.client.signal_errors[self.workflow_id]
         self.client.signals.append((self.workflow_id, signal, arg))
 
 
@@ -130,6 +134,21 @@ class TestLinearWebhook(unittest.TestCase):
         self.assertEqual(kwargs["id"], "implement-issue-issue-uuid")
         self.assertEqual(args[1].identifier, "ENG-12")
 
+    def test_in_review_starts_review_workflow(self) -> None:
+        payload = issue_payload(
+            "update",
+            labels=[FEATURE],
+            updated_from={"stateId": "s-old"},
+            state={"id": "s3", "name": "In Review"},
+            webhook_timestamp=now_ms(),
+        )
+        response = self.post(json.dumps(payload).encode())
+        self.assertEqual(response.json(), {"status": "accepted"})
+        ((args, kwargs),) = self.temporal.started
+        self.assertIs(args[0], ReviewIssueWorkflow.run)
+        self.assertEqual(kwargs["id"], "review-issue-issue-uuid")
+        self.assertEqual(args[1].identifier, "ENG-12")
+
     def test_label_added_and_in_progress_starts_plan(self) -> None:
         response = self.post(
             self.in_progress_body([FEATURE], {"labelIds": [], "stateId": "s-old"})
@@ -166,16 +185,34 @@ class TestLinearWebhook(unittest.TestCase):
         body = json.dumps(comment_payload(webhook_timestamp=now_ms(), **kwargs)).encode()
         return self.post(body)
 
-    def test_reply_signals_implement_workflow(self) -> None:
+    def test_reply_signals_implement_and_review_workflows(self) -> None:
         response = self.post_comment()
         self.assertEqual(response.json(), {"status": "accepted"})
-        ((wf_id, signal, arg),) = self.temporal.signals
-        self.assertEqual(wf_id, "implement-issue-issue-uuid")
-        self.assertEqual(signal, ImplementIssueWorkflow.human_answer)
-        self.assertEqual(arg, HumanAnswer("question-1", "comment-1", "Use bcrypt"))
+        answer = HumanAnswer("question-1", "comment-1", "Use bcrypt")
+        self.assertEqual(
+            self.temporal.signals,
+            [
+                ("implement-issue-issue-uuid", ImplementIssueWorkflow.human_answer, answer),
+                ("review-issue-issue-uuid", ReviewIssueWorkflow.human_answer, answer),
+            ],
+        )
 
-    def test_reply_without_running_workflow_is_ignored(self) -> None:
-        self.temporal.signal_error = RPCError("not found", RPCStatusCode.NOT_FOUND, b"")
+    def test_reply_signals_review_workflow_when_implement_not_found(self) -> None:
+        self.temporal.signal_errors = {
+            "implement-issue-issue-uuid": RPCError("not found", RPCStatusCode.NOT_FOUND, b"")
+        }
+        response = self.post_comment()
+        self.assertEqual(response.json(), {"status": "accepted"})
+        ((wf_id, signal, _),) = self.temporal.signals
+        self.assertEqual(wf_id, "review-issue-issue-uuid")
+        self.assertEqual(signal, ReviewIssueWorkflow.human_answer)
+
+    def test_reply_without_any_workflow_is_ignored(self) -> None:
+        not_found = RPCError("not found", RPCStatusCode.NOT_FOUND, b"")
+        self.temporal.signal_errors = {
+            "implement-issue-issue-uuid": not_found,
+            "review-issue-issue-uuid": not_found,
+        }
         response = self.post_comment()
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"status": "ignored"})

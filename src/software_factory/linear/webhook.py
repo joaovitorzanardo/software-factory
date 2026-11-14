@@ -16,10 +16,12 @@ from software_factory.linear.events import (
     parse_reply,
     should_implement,
     should_process,
+    should_review,
 )
 from software_factory.linear.signature import is_fresh, verify_signature
 from software_factory.orchestration.implement_workflow import ImplementIssueWorkflow
 from software_factory.orchestration.models import PlanIssueInput
+from software_factory.orchestration.review_workflow import ReviewIssueWorkflow
 from software_factory.orchestration.workflow import PlanIssueWorkflow
 
 logger = logging.getLogger(__name__)
@@ -64,19 +66,28 @@ async def handle_issue(
 
 
 async def handle_reply(client: Any, reply: CommentReply, delivery_id: str | None) -> bool:
-    """Entrega a resposta ao workflow de implementação; False se não há um rodando."""
-    workflow_id = f"implement-issue-{reply.issue_id}"
-    try:
-        await client.get_workflow_handle(workflow_id).signal(
-            ImplementIssueWorkflow.human_answer, reply.answer
-        )
-    except RPCError as exc:
-        if exc.status == RPCStatusCode.NOT_FOUND:
-            logger.info("sem workflow %s rodando; delivery=%s", workflow_id, delivery_id)
-            return False
-        raise
-    logger.info("resposta enviada a %s; delivery=%s", workflow_id, delivery_id)
-    return True
+    """Entrega a resposta aos workflows de implementação e de review da issue.
+
+    O que não tem pergunta pendente ignora o signal. False se nenhum está rodando.
+    """
+    delivered = False
+    for prefix, workflow_cls in (
+        ("implement-issue", ImplementIssueWorkflow),
+        ("review-issue", ReviewIssueWorkflow),
+    ):
+        workflow_id = f"{prefix}-{reply.issue_id}"
+        try:
+            await client.get_workflow_handle(workflow_id).signal(
+                workflow_cls.human_answer, reply.answer
+            )
+        except RPCError as exc:
+            if exc.status == RPCStatusCode.NOT_FOUND:
+                logger.info("sem workflow %s rodando; delivery=%s", workflow_id, delivery_id)
+                continue
+            raise
+        logger.info("resposta enviada a %s; delivery=%s", workflow_id, delivery_id)
+        delivered = True
+    return delivered
 
 
 @router.post("/webhooks/linear")
@@ -115,6 +126,11 @@ async def linear_webhook(request: Request) -> dict[str, str]:
         workflow_kwargs = {
             "workflow_run": ImplementIssueWorkflow.run,
             "id_prefix": "implement-issue",
+        }
+    elif should_review(payload, settings.trigger_labels):
+        workflow_kwargs = {
+            "workflow_run": ReviewIssueWorkflow.run,
+            "id_prefix": "review-issue",
         }
     else:
         logger.debug(
