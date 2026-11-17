@@ -12,6 +12,8 @@ from software_factory.orchestration.activities import SandboxActivities
 from software_factory.orchestration.github_activities import GitHubActivities
 from software_factory.orchestration.implement_workflow import ImplementIssueWorkflow
 from software_factory.orchestration.linear_activities import LinearActivities
+from software_factory.orchestration.reconcile_activities import ReconcileActivities
+from software_factory.orchestration.reconcile_workflow import ReconcileIssuesWorkflow
 from software_factory.orchestration.review_activities import ReviewActivities
 from software_factory.orchestration.review_workflow import ReviewIssueWorkflow
 from software_factory.orchestration.workflow import PlanIssueWorkflow
@@ -21,12 +23,19 @@ async def run_worker(settings: FactorySettings) -> None:
     client = await Client.connect(settings.temporal_address)
     activities = SandboxActivities(settings)
     review = ReviewActivities(activities)
-    linear = LinearActivities(LinearClient(settings.linear_api_key))
+    linear_client = LinearClient(settings.linear_api_key)
+    linear = LinearActivities(linear_client)
+    reconcile = ReconcileActivities(linear_client, client, settings.task_queue)
     github = GitHubActivities(GitHubClient(settings.github_token, settings.target_repo))
     worker = Worker(
         client,
         task_queue=settings.task_queue,
-        workflows=[PlanIssueWorkflow, ImplementIssueWorkflow, ReviewIssueWorkflow],
+        workflows=[
+            PlanIssueWorkflow,
+            ImplementIssueWorkflow,
+            ReviewIssueWorkflow,
+            ReconcileIssuesWorkflow,
+        ],
         activities=[
             activities.create_sandbox,
             activities.clone_repo,
@@ -48,6 +57,8 @@ async def run_worker(settings: FactorySettings) -> None:
             github.open_pull_request,
             github.pull_request_info,
             github.merge_pull_request,
+            reconcile.list_pending_issues,
+            reconcile.start_missed_workflow,
         ],
     )
     logging.getLogger(__name__).info("worker ouvindo task queue %s", settings.task_queue)
