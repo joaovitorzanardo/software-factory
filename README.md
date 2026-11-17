@@ -94,8 +94,14 @@ Em um terminal separado:
 temporal server start-dev --db-filename temporal.db
 ```
 
-Sem `--db-filename` o histórico fica em memória e some quando o servidor reinicia, o que afeta
-a [reconciliação no startup](#reconciliação-no-startup).
+Sem `--db-filename` o histórico fica em memória e some quando o servidor reinicia. O namespace
+`default` do servidor de dev guarda workflows fechados por **24h**. As duas coisas afetam a
+[reconciliação no startup](#reconciliação-no-startup). Para recuperar eventos de paradas mais
+longas, aumente a retenção uma vez:
+
+```bash
+temporal operator namespace update --namespace default --retention 30d
+```
 
 - Temporal Service: `localhost:7233`
 - Web UI: http://localhost:8233
@@ -273,9 +279,16 @@ Limitações:
 
 - Uma label adicionada fora de `To Do` com o servidor fora não é recuperada, e `In Planning` não
   é varrido (é onde um planejamento que falhou deixa a issue).
-- A checagem usa o histórico do Temporal. Com o servidor de dev em memória, ou depois da
-  retenção do namespace, os runs antigos somem, e uma issue cujo run falhou volta a rodar.
-  Use `temporal server start-dev --db-filename <arquivo>`.
+- A checagem usa o histórico do Temporal, que só guarda runs fechados durante a retenção do
+  namespace (24h no servidor de dev). Gatilho mais antigo que a retenção é **pulado**, com um
+  aviso no log do worker: não dá para saber se já rodou, e reexecutar uma implementação ou uma
+  review que falhou custa caro (a review pode até fazer merge). Aumente a retenção (seção
+  Temporal) para cobrir paradas mais longas.
+- Com o servidor de dev em memória (sem `--db-filename`), reiniciar o Temporal apaga o histórico
+  dentro da retenção também, e uma issue cujo run falhou volta a rodar.
+- A varredura pega as issues de **todos os times** que a `LINEAR_API_KEY` enxerga, como um
+  webhook configurado para todos os times. Se o webhook é de um time só, use uma chave (ou um
+  workspace) que só enxergue esse time.
 
 ## Testes
 

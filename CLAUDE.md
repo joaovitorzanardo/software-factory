@@ -183,8 +183,10 @@ tests/                # unittest; payloads.py tem fixtures no formato do Linear
   (`count_workflows`) runs de `<prefixo>-<id>` com `StartTime >= gatilho - CLOCK_SKEW_TOLERANCE
   (2 min)`: algum → pula (falha depois do gatilho conta como consumido); nenhum → inicia pelo
   `dispatch.start_issue_workflow` (rodando → pula). `In Planning` e label adicionada fora de
-  `To Do` não são recuperados. Depende do histórico do Temporal (dev server em memória/retenção
-  → runs falhos voltam a rodar).
+  `To Do` não são recuperados. Gatilho mais antigo que a retenção do namespace
+  (`describe_namespace`; 24h no dev server) é pulado com warning, porque o run pode ter saído da
+  visibility. Dev server em memória reiniciado → runs falhos voltam a rodar. A varredura cobre todos
+  os times que a `LINEAR_API_KEY` enxerga.
 
 ## Comandos
 

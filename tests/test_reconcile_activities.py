@@ -1,8 +1,11 @@
 import json
 import unittest
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import httpx
+from google.protobuf.duration_pb2 import Duration
+from temporalio.api.workflowservice.v1 import DescribeNamespaceResponse
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
 from software_factory.linear.client import LinearClient
@@ -21,11 +24,28 @@ PENDING = PendingIssue(
 
 
 class FakeTemporal:
-    def __init__(self, count: int = 0, start_error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        count: int = 0,
+        start_error: Exception | None = None,
+        retention: timedelta = timedelta(days=3650),
+    ) -> None:
         self.count = count
         self.start_error = start_error
         self.queries: list[str] = []
         self.started: list[tuple[tuple, dict]] = []
+        self.namespace = "default"
+        self.described: list[str] = []
+        response = DescribeNamespaceResponse()
+        response.config.workflow_execution_retention_ttl.CopyFrom(
+            Duration(seconds=int(retention.total_seconds()))
+        )
+
+        async def describe_namespace(request):
+            self.described.append(request.namespace)
+            return response
+
+        self.workflow_service = SimpleNamespace(describe_namespace=describe_namespace)
 
     async def count_workflows(self, query: str) -> SimpleNamespace:
         self.queries.append(query)
@@ -94,3 +114,27 @@ class TestStartMissedWorkflow(unittest.IsolatedAsyncioTestCase):
             count=0, start_error=WorkflowAlreadyStartedError("implement-issue-issue-1", "x")
         )
         self.assertFalse(await activities(temporal).start_missed_workflow(PENDING))
+
+    async def test_skips_trigger_older_than_retention(self) -> None:
+        # Runs fechados há mais que a retenção somem da visibility: sem como saber se já rodou.
+        temporal = FakeTemporal(count=0, retention=timedelta(days=1))
+        old = datetime.now(UTC) - timedelta(days=2)
+        stale = PendingIssue(
+            kind=PENDING.kind,
+            issue=PENDING.issue,
+            triggered_at=old.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+        )
+        self.assertFalse(await activities(temporal).start_missed_workflow(stale))
+        self.assertEqual(temporal.described, ["default"])
+        self.assertEqual(temporal.queries, [])
+        self.assertEqual(temporal.started, [])
+
+    async def test_recent_trigger_within_retention_starts(self) -> None:
+        temporal = FakeTemporal(count=0, retention=timedelta(days=1))
+        recent = datetime.now(UTC) - timedelta(hours=1)
+        fresh = PendingIssue(
+            kind=PENDING.kind,
+            issue=PENDING.issue,
+            triggered_at=recent.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+        )
+        self.assertTrue(await activities(temporal).start_missed_workflow(fresh))
