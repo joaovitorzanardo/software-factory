@@ -255,3 +255,25 @@ class ReviewResult:
     pr_url: str | None = None
     # Identifiers das issues criadas.
     follow_ups: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ReconcileInput:
+    # Labels que disparam a factory (as mesmas do webhook).
+    trigger_labels: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PendingIssue:
+    # KIND_PLAN, KIND_IMPLEMENT ou KIND_REVIEW (dispatch.py).
+    kind: str
+    issue: PlanIssueInput
+    # ISO 8601 UTC, como vem do Linear: quando o evento que dispara a etapa aconteceu.
+    triggered_at: str
+
+
+@dataclass(frozen=True)
+class ReconcileResult:
+    # Workflow ids iniciados.
+    started: list[str]
+    skipped: int
