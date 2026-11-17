@@ -5,7 +5,6 @@ import time
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
-from temporalio.exceptions import WorkflowAlreadyStartedError
 from temporalio.service import RPCError, RPCStatusCode
 
 from software_factory.config import Settings
@@ -19,10 +18,15 @@ from software_factory.linear.events import (
     should_review,
 )
 from software_factory.linear.signature import is_fresh, verify_signature
+from software_factory.orchestration.dispatch import (
+    KIND_IMPLEMENT,
+    KIND_PLAN,
+    KIND_REVIEW,
+    start_issue_workflow,
+)
 from software_factory.orchestration.implement_workflow import ImplementIssueWorkflow
 from software_factory.orchestration.models import PlanIssueInput
 from software_factory.orchestration.review_workflow import ReviewIssueWorkflow
-from software_factory.orchestration.workflow import PlanIssueWorkflow
 
 logger = logging.getLogger(__name__)
 
@@ -34,35 +38,22 @@ async def handle_issue(
     task_queue: str,
     issue: LinearIssue,
     delivery_id: str | None,
-    workflow_run: Any = PlanIssueWorkflow.run,
-    id_prefix: str = "plan-issue",
+    kind: str = KIND_PLAN,
 ) -> bool:
-    """Inicia o workflow da issue; retorna False se já há um rodando para ela."""
-    workflow_id = f"{id_prefix}-{issue.id}"
-    try:
-        await client.start_workflow(
-            workflow_run,
-            PlanIssueInput(
-                issue_id=issue.id,
-                identifier=issue.identifier,
-                title=issue.title,
-                description=issue.description,
-                url=issue.url,
-            ),
-            id=workflow_id,
-            task_queue=task_queue,
-        )
-    except WorkflowAlreadyStartedError:
-        logger.info("workflow %s já em execução; delivery=%s", workflow_id, delivery_id)
-        return False
-    logger.info(
-        "workflow %s iniciado: %s %r delivery=%s",
-        workflow_id,
-        issue.identifier,
-        issue.title,
-        delivery_id,
+    """Inicia o workflow `kind` da issue; retorna False se já há um rodando para ela."""
+    return await start_issue_workflow(
+        client,
+        task_queue,
+        kind,
+        PlanIssueInput(
+            issue_id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            description=issue.description,
+            url=issue.url,
+        ),
+        f"delivery={delivery_id}",
     )
-    return True
 
 
 async def handle_reply(client: Any, reply: CommentReply, delivery_id: str | None) -> bool:
@@ -121,17 +112,11 @@ async def linear_webhook(request: Request) -> dict[str, str]:
 
     # Label adicionada e status mudado no mesmo evento: o planejamento vence.
     if should_process(payload, settings.trigger_labels):
-        workflow_kwargs: dict[str, Any] = {}
+        kind = KIND_PLAN
     elif should_implement(payload, settings.trigger_labels):
-        workflow_kwargs = {
-            "workflow_run": ImplementIssueWorkflow.run,
-            "id_prefix": "implement-issue",
-        }
+        kind = KIND_IMPLEMENT
     elif should_review(payload, settings.trigger_labels):
-        workflow_kwargs = {
-            "workflow_run": ReviewIssueWorkflow.run,
-            "id_prefix": "review-issue",
-        }
+        kind = KIND_REVIEW
     else:
         logger.debug(
             "evento ignorado: %s %s delivery=%s",
@@ -147,7 +132,7 @@ async def linear_webhook(request: Request) -> dict[str, str]:
             settings.task_queue,
             parse_issue(payload),
             delivery_id,
-            **workflow_kwargs,
+            kind=kind,
         )
     except Exception:
         # 503 faz o Linear reenviar quando o Temporal voltar.
