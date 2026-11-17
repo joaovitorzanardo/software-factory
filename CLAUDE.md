@@ -80,6 +80,12 @@ src/software_factory/
                       # testes → (verde: push → PR → In Review; vermelho: loop analisar → planejar → corrigir)
     review_workflow.py # ReviewIssueWorkflow: In Review → review → corrige em loop → follow-ups → merge squash → Done
     skills/writing-plans/, skills/systematic-debugging/, skills/requesting-code-review/, skills/receiving-code-review/  # vendorizadas do superpowers (SKILL.md + LICENSE)
+    dispatch.py       # KIND_PLAN/IMPLEMENT/REVIEW, ISSUE_WORKFLOWS, issue_workflow_id, start_issue_workflow
+                      # (usado pelo webhook e pela reconciliação)
+    reconcile.py      # regras puras: pending_issue (status → etapa) e trigger_time
+    reconcile_activities.py # ReconcileActivities(linear, temporal, task_queue): list_pending_issues,
+                            # start_missed_workflow
+    reconcile_workflow.py   # ReconcileIssuesWorkflow (id reconcile-issues), iniciado no startup do servidor
     worker.py         # entrypoint `software-factory-worker`
 tests/                # unittest; payloads.py tem fixtures no formato do Linear
 ```
@@ -168,7 +174,19 @@ tests/                # unittest; payloads.py tem fixtures no formato do Linear
   `To Do`; senão planeja sem mover) e, depois do commit do plano e do kill do sandbox, move para
   `In Progress`. Status procurados por nome (case-insensitive) no time da issue; status inexistente
   falha sem retry. Em falha não há compensação: a issue fica em `In Planning`.
-- Não há varredura de issues existentes em TODO (projeto novo, sem backlog).
+- **Reconciliação no startup:** o `lifespan` do servidor de webhooks (`start_reconcile` em `api.py`)
+  inicia o `ReconcileIssuesWorkflow` (id `reconcile-issues`; já rodando ou erro → só log, o servidor
+  sobe). No worker, `list_pending_issues` busca (GraphQL, paginado) issues com label de gatilho em
+  `To Do` (→ plan), `In Progress` (→ implement) e `In Review` (→ review), e calcula o gatilho:
+  `To Do` = o mais recente entre `createdAt` e a adição de label de gatilho no `history`; os outros
+  = a última entrada no status (sem entrada, `createdAt`). `start_missed_workflow` conta
+  (`count_workflows`) runs de `<prefixo>-<id>` com `StartTime >= gatilho - CLOCK_SKEW_TOLERANCE
+  (2 min)`: algum → pula (falha depois do gatilho conta como consumido); nenhum → inicia pelo
+  `dispatch.start_issue_workflow` (rodando → pula). `In Planning` e label adicionada fora de
+  `To Do` não são recuperados. Gatilho mais antigo que a retenção do namespace
+  (`describe_namespace`; 24h no dev server) é pulado com warning, porque o run pode ter saído da
+  visibility. Dev server em memória reiniciado → runs falhos voltam a rodar. A varredura cobre todos
+  os times que a `LINEAR_API_KEY` enxerga.
 
 ## Comandos
 
@@ -177,7 +195,7 @@ tests/                # unittest; payloads.py tem fixtures no formato do Linear
 uv venv .venv && source .venv/bin/activate && uv pip install -e ".[dev]"
 
 # servidor Temporal local (terminal separado) — gRPC localhost:7233, UI http://localhost:8233
-temporal server start-dev
+temporal server start-dev --db-filename temporal.db
 
 # worker do Temporal (lê .env; precisa de E2B_API_KEY, ANTHROPIC_API_KEY ou CLAUDE_CODE_OAUTH_TOKEN, GITHUB_TOKEN, TARGET_REPO, LINEAR_API_KEY, TEST_COMMAND)
 software-factory-worker

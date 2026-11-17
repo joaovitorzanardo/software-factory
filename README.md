@@ -91,7 +91,16 @@ cp .env.example .env   # preencha os segredos (ver abaixo)
 Em um terminal separado:
 
 ```bash
-temporal server start-dev
+temporal server start-dev --db-filename temporal.db
+```
+
+Sem `--db-filename` o histórico fica em memória e some quando o servidor reinicia. O namespace
+`default` do servidor de dev guarda workflows fechados por **24h**. As duas coisas afetam a
+[reconciliação no startup](#reconciliação-no-startup). Para recuperar eventos de paradas mais
+longas, aumente a retenção uma vez:
+
+```bash
+temporal operator namespace update --namespace default --retention 30d
 ```
 
 - Temporal Service: `localhost:7233`
@@ -247,6 +256,39 @@ retornam 200 `{"status": "ignored"}`.
 Issues aceitas iniciam o workflow (`{"status": "accepted"}`, ou `"duplicate"` se já houver um
 rodando para a issue);
 se o Temporal estiver indisponível, responde 503 para o Linear reenviar.
+
+## Reconciliação no startup
+
+Eventos que chegam com o servidor de webhooks fora se perdem. Por isso, ao subir, o servidor
+inicia o `ReconcileIssuesWorkflow` (id `reconcile-issues`). Ele roda no worker, busca no Linear
+as issues com label `Feature`/`Bug` e inicia a etapa que cada uma espera pelo status:
+
+| Status | Etapa | Momento do gatilho |
+| --- | --- | --- |
+| `To Do` | planejamento | o mais recente entre a criação e a adição de uma label de gatilho |
+| `In Progress` | implementação | a última entrada da issue no status |
+| `In Review` | review | a última entrada da issue no status |
+
+O workflow só é iniciado se nenhum run dele (`plan-issue-<id>`, `implement-issue-<id>`,
+`review-issue-<id>`) começou depois do gatilho, com 2 min de folga para diferença de relógio.
+Um run que falhou depois do gatilho conta como feito, como no webhook: reiniciar o servidor não
+refaz uma implementação que falhou. Um run ainda em execução também é pulado. Falha ao iniciar a
+reconciliação vai para o log e o servidor sobe mesmo assim.
+
+Limitações:
+
+- Uma label adicionada fora de `To Do` com o servidor fora não é recuperada, e `In Planning` não
+  é varrido (é onde um planejamento que falhou deixa a issue).
+- A checagem usa o histórico do Temporal, que só guarda runs fechados durante a retenção do
+  namespace (24h no servidor de dev). Gatilho mais antigo que a retenção é **pulado**, com um
+  aviso no log do worker: não dá para saber se já rodou, e reexecutar uma implementação ou uma
+  review que falhou custa caro (a review pode até fazer merge). Aumente a retenção (seção
+  Temporal) para cobrir paradas mais longas.
+- Com o servidor de dev em memória (sem `--db-filename`), reiniciar o Temporal apaga o histórico
+  dentro da retenção também, e uma issue cujo run falhou volta a rodar.
+- A varredura pega as issues de **todos os times** que a `LINEAR_API_KEY` enxerga, como um
+  webhook configurado para todos os times. Se o webhook é de um time só, use uma chave (ou um
+  workspace) que só enxergue esse time.
 
 ## Testes
 
