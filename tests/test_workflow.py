@@ -8,11 +8,13 @@ from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from software_factory.orchestration.models import (
+    CommentRequest,
     CommitPlanRequest,
     MoveIssueRequest,
     PlanIssueInput,
     PlanRequest,
     PlanResult,
+    UsageReportRequest,
 )
 from software_factory.orchestration.workflow import PlanIssueWorkflow
 
@@ -78,6 +80,16 @@ class FakeActivities:
     async def kill_sandbox(self, sandbox_id: str) -> None:
         self.calls.append("kill_sandbox")
 
+    @activity.defn(name="token_usage_report")
+    async def token_usage_report(self, request: UsageReportRequest) -> str:
+        self.calls.append(f"token_usage_report:final={request.final}")
+        return "relatório"
+
+    @activity.defn(name="upsert_comment")
+    async def upsert_comment(self, request: CommentRequest) -> str:
+        self.calls.append("upsert_comment")
+        return request.comment_id
+
 
 class TestPlanIssueWorkflow(unittest.IsolatedAsyncioTestCase):
     async def run_workflow(self, fake: FakeActivities) -> PlanResult:
@@ -94,6 +106,8 @@ class TestPlanIssueWorkflow(unittest.IsolatedAsyncioTestCase):
                     fake.generate_plan,
                     fake.commit_plan,
                     fake.kill_sandbox,
+                    fake.token_usage_report,
+                    fake.upsert_comment,
                 ],
             ):
                 return await env.client.execute_workflow(
@@ -124,6 +138,8 @@ class TestPlanIssueWorkflow(unittest.IsolatedAsyncioTestCase):
                 "generate_plan",
                 "commit_plan",
                 "kill_sandbox",
+                "token_usage_report:final=False",
+                "upsert_comment",
                 "move_issue:In Progress",
             ],
         )
@@ -137,6 +153,20 @@ class TestPlanIssueWorkflow(unittest.IsolatedAsyncioTestCase):
                     require_states=("In Progress",),
                 ),
                 MoveIssueRequest("issue-1", to_state="In Progress"),
+            ],
+        )
+
+    async def test_publishes_token_usage_before_in_progress(self) -> None:
+        fake = FakeActivities()
+        await self.run_workflow(fake)
+        self.assertEqual(
+            fake.calls[-5:],
+            [
+                "commit_plan",
+                "kill_sandbox",
+                "token_usage_report:final=False",
+                "upsert_comment",
+                "move_issue:In Progress",
             ],
         )
 

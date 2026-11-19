@@ -28,6 +28,7 @@ from software_factory.orchestration.models import (
     ReviewRequest,
     ReviewResult,
     TestRunResult,
+    UsageReportRequest,
 )
 from software_factory.orchestration.review_workflow import (
     FOLLOW_UP_TITLE_CAP,
@@ -78,7 +79,9 @@ class FakeReviewActivities:
         fail_review_times: int = 0,
         not_in_review: bool = False,
         fixed_head: str | None = None,
+        fail_upsert: bool = False,
     ) -> None:
+        self.fail_upsert = fail_upsert
         # Head clonado sempre igual (ninguém empurrou entre as sessões).
         self.fixed_head = fixed_head
         self.not_in_review = not_in_review
@@ -211,6 +214,18 @@ class FakeReviewActivities:
     async def kill_sandbox(self, sandbox_id: str) -> None:
         self.calls.append("kill_sandbox")
 
+    @activity.defn(name="token_usage_report")
+    async def token_usage_report(self, request: UsageReportRequest) -> str:
+        self.calls.append(f"token_usage_report:final={request.final}")
+        return "relatório"
+
+    @activity.defn(name="upsert_comment")
+    async def upsert_comment(self, request: CommentRequest) -> str:
+        self.calls.append("upsert_comment")
+        if self.fail_upsert:
+            raise ApplicationError("linear fora", non_retryable=True)
+        return request.comment_id
+
 
 class TestReviewIssueWorkflow(unittest.IsolatedAsyncioTestCase):
     async def run_workflow(self, fake: FakeReviewActivities) -> ReviewResult:
@@ -236,6 +251,8 @@ class TestReviewIssueWorkflow(unittest.IsolatedAsyncioTestCase):
                     fake.run_tests,
                     fake.commit_implementation,
                     fake.kill_sandbox,
+                    fake.token_usage_report,
+                    fake.upsert_comment,
                 ],
             ):
                 return await env.client.execute_workflow(
@@ -266,6 +283,8 @@ class TestReviewIssueWorkflow(unittest.IsolatedAsyncioTestCase):
                 "post_comment",
                 "merge_pull_request",
                 "move_issue:Done",
+                "token_usage_report:final=True",
+                "upsert_comment",
             ],
         )
         self.assertEqual(fake.moves[0].require_states, ("Done",))
@@ -273,6 +292,32 @@ class TestReviewIssueWorkflow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake.moves[-1].from_state, "In Review")
         self.assertEqual(fake.merge_requests, [MergeRequest("ENG-12", ISSUE.title, 7, "sha-1")])
         self.assertEqual(fake.review_requests[0].base_sha, PULL.base_sha)
+
+    async def test_publishes_final_after_done(self) -> None:
+        fake = FakeReviewActivities()
+        await self.run_workflow(fake)
+        self.assertEqual(
+            fake.calls[-3:],
+            ["move_issue:Done", "token_usage_report:final=True", "upsert_comment"],
+        )
+        self.assertNotIn("token_usage_report:final=False", fake.calls)
+
+    async def test_publishes_when_stopped(self) -> None:
+        fake = FakeReviewActivities(
+            reports=[ReviewReport("Bug.", (finding("fix", "bug"),))], stop_after_checks=1
+        )
+        result = await self.run_workflow(fake)
+        self.assertEqual(result.outcome, "stopped")
+        self.assertEqual(
+            fake.calls[-2:], ["token_usage_report:final=False", "upsert_comment"]
+        )
+        self.assertNotIn("token_usage_report:final=True", fake.calls)
+
+    async def test_publish_failure_does_not_fail_workflow(self) -> None:
+        fake = FakeReviewActivities(fail_upsert=True)
+        result = await self.run_workflow(fake)
+        self.assertEqual(result, ReviewResult("ENG-12", "merged", PR_URL))
+        self.assertEqual(fake.moves[-1].to_state, "Done")
 
     async def test_fix_findings_trigger_fix_session_and_rereview(self) -> None:
         fix = finding("fix", "bug")

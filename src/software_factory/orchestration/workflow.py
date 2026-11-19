@@ -14,6 +14,7 @@ with workflow.unsafe.imports_passed_through():
         PlanRequest,
         PlanResult,
     )
+    from software_factory.orchestration.token_reporting import publish_token_usage
 
 MOVE_ISSUE_TIMEOUT = timedelta(seconds=30)
 MOVE_ISSUE_RETRY = RetryPolicy(maximum_attempts=5)
@@ -79,6 +80,7 @@ class PlanIssueWorkflow:
                 start_to_close_timeout=timedelta(minutes=1),
                 retry_policy=RetryPolicy(maximum_attempts=5),
             )
+        await publish_token_usage(issue.issue_id)
         await workflow.execute_activity(
             "move_issue",
             MoveIssueRequest(issue.issue_id, to_state=STATE_IN_PROGRESS),

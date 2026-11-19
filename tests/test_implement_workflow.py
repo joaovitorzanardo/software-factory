@@ -23,6 +23,7 @@ from software_factory.orchestration.models import (
     PlanIssueInput,
     PullRequestRequest,
     TestRunResult,
+    UsageReportRequest,
 )
 
 ISSUE = PlanIssueInput(
@@ -197,6 +198,16 @@ class FakeActivities:
         self.pulls.append(request)
         return PR_URL
 
+    @activity.defn(name="token_usage_report")
+    async def token_usage_report(self, request: UsageReportRequest) -> str:
+        self.calls.append(f"token_usage_report:final={request.final}")
+        return "relatório"
+
+    @activity.defn(name="upsert_comment")
+    async def upsert_comment(self, request: CommentRequest) -> str:
+        self.calls.append("upsert_comment")
+        return request.comment_id
+
 
 class TestImplementIssueWorkflow(unittest.IsolatedAsyncioTestCase):
     async def run_workflow(self, fake: FakeActivities) -> ImplementResult:
@@ -220,6 +231,8 @@ class TestImplementIssueWorkflow(unittest.IsolatedAsyncioTestCase):
                     fake.commit_implementation,
                     fake.kill_sandbox,
                     fake.open_pull_request,
+                    fake.token_usage_report,
+                    fake.upsert_comment,
                 ],
             ):
                 return await env.client.execute_workflow(
@@ -245,6 +258,8 @@ class TestImplementIssueWorkflow(unittest.IsolatedAsyncioTestCase):
                 "commit_implementation",
                 "kill_sandbox",
                 "open_pull_request",
+                "token_usage_report:final=False",
+                "upsert_comment",
                 "move_issue:In Review",
             ],
         )
@@ -263,6 +278,27 @@ class TestImplementIssueWorkflow(unittest.IsolatedAsyncioTestCase):
         self.assertIs(fake.commits[0].require_changes, True)
         self.assertEqual(
             fake.pulls, [PullRequestRequest("ENG-12", "Adicionar login", ISSUE.url)]
+        )
+
+    async def test_publishes_before_in_review(self) -> None:
+        fake = FakeActivities()
+        await self.run_workflow(fake)
+        self.assertEqual(
+            fake.calls[-4:],
+            [
+                "open_pull_request",
+                "token_usage_report:final=False",
+                "upsert_comment",
+                "move_issue:In Review",
+            ],
+        )
+
+    async def test_publishes_when_stopped(self) -> None:
+        fake = FakeActivities(red_runs=3, stop_after_checks=1)
+        result = await self.run_workflow(fake)
+        self.assertEqual(result.outcome, "stopped")
+        self.assertEqual(
+            fake.calls[-2:], ["token_usage_report:final=False", "upsert_comment"]
         )
 
     async def test_skips_when_not_in_progress(self) -> None:
@@ -310,6 +346,8 @@ class TestImplementIssueWorkflow(unittest.IsolatedAsyncioTestCase):
                 "commit_implementation",
                 "kill_sandbox",
                 "open_pull_request",
+                "token_usage_report:final=False",
+                "upsert_comment",
                 "move_issue:In Review",
             ],
         )
