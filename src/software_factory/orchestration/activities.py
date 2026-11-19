@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +10,8 @@ from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
 from software_factory.config import FactorySettings
+from software_factory.orchestration.notify_activities import UsageAlertNotifier
+from software_factory.orchestration.usage import UsageWatcher
 from software_factory.orchestration.models import (
     AnalyzeRequest,
     CloneBranchRequest,
@@ -48,6 +51,8 @@ TEST_COMMAND_TIMEOUT_S = 10 * 60
 ANALYZE_COMMAND_TIMEOUT_S = 25 * 60
 TEST_OUTPUT_TAIL = 4000
 HEARTBEAT_INTERVAL_S = 30
+# Teto para as notificações de uso terminarem antes da activity devolver.
+NOTIFY_WAIT_S = 30
 GIT_COMMAND_TIMEOUT_S = 60
 CLONE_BRANCH_DEPTH = 50
 # commit/push com hooks desligados: hooks plantados em .git/hooks (o Claude teve Bash) não rodam
@@ -242,8 +247,17 @@ def parse_result(stdout: str) -> str:
     return result["result"]
 
 
-async def _run_with_heartbeat(sandbox: Any, cmd: str, timeout: int) -> Any:
-    """Roda um comando longo em REPO_DIR mantendo o heartbeat da activity."""
+async def _run_with_heartbeat(
+    sandbox: Any, cmd: str, timeout: int, on_line: Callable[[str], None] | None = None
+) -> Any:
+    """Roda um comando longo em REPO_DIR mantendo o heartbeat da activity.
+
+    `on_line` recebe cada chunk do stdout (não necessariamente linhas inteiras)."""
+
+    def on_stdout(chunk: str) -> None:
+        activity.heartbeat()
+        if on_line:
+            on_line(chunk)
 
     # O comando pode ficar muito tempo sem emitir nada; heartbeat periódico além do stdout.
     async def keep_alive() -> None:
@@ -256,7 +270,7 @@ async def _run_with_heartbeat(sandbox: Any, cmd: str, timeout: int) -> Any:
         return await sandbox.commands.run(
             cmd,
             cwd=REPO_DIR,
-            on_stdout=lambda _chunk: activity.heartbeat(),
+            on_stdout=on_stdout,
             timeout=timeout,
         )
     finally:
@@ -264,9 +278,42 @@ async def _run_with_heartbeat(sandbox: Any, cmd: str, timeout: int) -> Any:
 
 
 class SandboxActivities:
-    def __init__(self, settings: FactorySettings, sandbox_cls: Any = AsyncSandbox) -> None:
+    def __init__(
+        self,
+        settings: FactorySettings,
+        sandbox_cls: Any = AsyncSandbox,
+        usage_notifier: UsageAlertNotifier | None = None,
+    ) -> None:
         self.settings = settings
         self.sandbox_cls = sandbox_cls
+        self.usage_notifier = usage_notifier
+
+    async def _run_claude(self, sandbox: Any, cmd: str, timeout: int) -> Any:
+        """Roda uma sessão do Claude e avisa quando o uso da sessão passa do limiar."""
+        notifier = self.usage_notifier
+        if notifier is None:
+            return await _run_with_heartbeat(sandbox, cmd, timeout)
+        info = activity.info()
+        watcher = UsageWatcher(f"{info.workflow_id}/{info.activity_type}")
+        tasks: set[asyncio.Task[bool]] = set()
+
+        def on_line(chunk: str) -> None:
+            for alert in watcher.feed(chunk):
+                tasks.add(asyncio.create_task(notifier.notify(alert)))
+
+        try:
+            return await _run_with_heartbeat(sandbox, cmd, timeout, on_line=on_line)
+        finally:
+            if tasks:
+                # O aviso nunca derruba a sessão: erros e demora ficam só no log.
+                done, pending = await asyncio.wait(tasks, timeout=NOTIFY_WAIT_S)
+                for task in pending:
+                    task.cancel()
+                for task in done:
+                    if not task.cancelled() and task.exception():
+                        activity.logger.warning(
+                            "aviso de uso falhou: %r", task.exception()
+                        )
 
     async def _connect(self, sandbox_id: str) -> Any:
         return await self.sandbox_cls.connect(sandbox_id, api_key=self.settings.e2b_api_key)
@@ -311,7 +358,7 @@ class SandboxActivities:
         if await sandbox.files.exists(f"{REPO_DIR}/{path}"):
             await sandbox.files.remove(f"{REPO_DIR}/{path}")
         await sandbox.files.write(PROMPT_PATH, build_plan_prompt(request.issue))
-        result = await _run_with_heartbeat(
+        result = await self._run_claude(
             sandbox, plan_command(request.issue.identifier), PLAN_COMMAND_TIMEOUT_S
         )
         # O texto final do Claude é só um resumo; o plano é o arquivo salvo.
@@ -389,7 +436,7 @@ class SandboxActivities:
             IMPLEMENT_PROMPT_PATH,
             build_implement_prompt(request.issue, self.settings.test_command),
         )
-        result = await _run_with_heartbeat(
+        result = await self._run_claude(
             sandbox, implement_command(), IMPLEMENT_COMMAND_TIMEOUT_S
         )
         return parse_result(result.stdout)
@@ -406,7 +453,7 @@ class SandboxActivities:
         await sandbox.files.write(
             ANALYZE_PROMPT_PATH, build_analyze_prompt(request, self.settings.test_command)
         )
-        result = await _run_with_heartbeat(sandbox, analyze_command(), ANALYZE_COMMAND_TIMEOUT_S)
+        result = await self._run_claude(sandbox, analyze_command(), ANALYZE_COMMAND_TIMEOUT_S)
         parse_result(result.stdout)
 
         async def read_optional(path: str) -> str:
@@ -435,7 +482,7 @@ class SandboxActivities:
         await sandbox.files.write(
             FIX_PROMPT_PATH, build_fix_prompt(request, self.settings.test_command)
         )
-        result = await _run_with_heartbeat(sandbox, fix_command(), IMPLEMENT_COMMAND_TIMEOUT_S)
+        result = await self._run_claude(sandbox, fix_command(), IMPLEMENT_COMMAND_TIMEOUT_S)
         return parse_result(result.stdout)
 
     @activity.defn

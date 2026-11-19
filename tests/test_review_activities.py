@@ -33,7 +33,15 @@ from software_factory.orchestration.review_prompts import (
     REVIEW_JSON_PATH,
     SECURITY_PATH,
 )
-from tests.test_activities import ISSUE, SETTINGS, FakeSandbox, stream
+from tests.test_activities import (
+    ISSUE,
+    SETTINGS,
+    USAGE_EVENT,
+    USAGE_RESET,
+    FakeNotifier,
+    FakeSandbox,
+    stream,
+)
 
 BASE_SHA = "b" * 40
 FINDING = {
@@ -90,6 +98,19 @@ class TestReviewActivities(unittest.IsolatedAsyncioTestCase):
 
         FakeSandbox.instance.commands.hook = hook
         return events
+
+    async def test_review_pull_notifies_usage(self) -> None:
+        notifier = FakeNotifier()
+        sandbox = SandboxActivities(SETTINGS, sandbox_cls=FakeSandbox, usage_notifier=notifier)
+        activities = ReviewActivities(sandbox)
+        self.claude_reviews()
+        FakeSandbox.instance.commands.stdout = stream(
+            USAGE_EVENT, {"type": "result", "subtype": "success", "result": "Relatório salvo."}
+        )
+        await self.env.run(activities.review_pull, self.request)
+        # Um watcher por sessão do Claude; o dedup entre elas é do Temporal (id por janela).
+        self.assertGreaterEqual(len(notifier.alerts), 1)
+        self.assertEqual({alert.resets_at for alert in notifier.alerts}, {USAGE_RESET})
 
     async def test_review_pull_runs_lenses_in_parallel_then_triage(self) -> None:
         events = self.claude_reviews()
