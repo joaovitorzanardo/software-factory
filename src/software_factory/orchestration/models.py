@@ -134,6 +134,13 @@ class CommentRequest:
 
 
 @dataclass(frozen=True)
+class UsageReportRequest:
+    issue_id: str
+    # Com final, o comentário inclui a linha de total.
+    final: bool = False
+
+
+@dataclass(frozen=True)
 class HumanAnswer:
     # Id do comentário da pergunta (parentId do reply).
     question_id: str
