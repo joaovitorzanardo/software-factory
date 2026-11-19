@@ -128,7 +128,7 @@ temporal operator namespace update --namespace default --retention 30d
 | `ALERT_EMAIL_FROM` | worker | remetente do aviso (default `SMTP_USERNAME`) |
 | `ALERT_EMAIL_TO` | worker | destinatário do aviso; obrigatória com `SMTP_HOST` |
 | `ALERT_TIMEZONE` | worker | fuso do horário do reset no email (default `America/Sao_Paulo`) |
-| `TOKEN_USAGE_DB` | worker | opcional: arquivo SQLite do uso de tokens (default `token_usage.db`) |
+| `TOKEN_USAGE_DB` | worker | opcional: arquivo SQLite do uso de tokens (default `token_usage.db`); no WSL com o repo em `/mnt/c` ou OneDrive, prefira um caminho no lado Linux (ex.: `~/.local/share/software-factory/token_usage.db`): o lock do SQLite em drvfs não é confiável, a sincronização pode travar ou reverter o arquivo, e erro de escrita só vira warning no log |
 
 ### Aviso de uso da sessão do Claude
 
@@ -158,7 +158,8 @@ e tem granularidade de 1%. Sem o evento `result` do stream, os tokens vêm da so
 sqlite3 token_usage.db "SELECT issue_id, stage, COUNT(*) sessoes,
   SUM(input_tokens+output_tokens+cache_creation_tokens+cache_read_tokens) total,
   SUM(cost_usd) custo FROM sessions GROUP BY issue_id, stage"
-# média de tokens por 1% da janela de 5h (com assinatura)
+# média de tokens por 1% da janela de 5h (com assinatura); aproximada: sessão que cruza duas janelas conta nos
+# dois grupos e sessões sem amostras da janela ficam de fora
 sqlite3 token_usage.db "SELECT AVG(t / (s*100)) FROM (SELECT SUM(input_tokens+output_tokens+cache_creation_tokens+cache_read_tokens) t,
   MAX(w.util_last)-MIN(w.util_first) s FROM sessions JOIN session_windows w ON w.session_key = sessions.key
   GROUP BY sessions.issue_id, sessions.stage, w.resets_at HAVING s > 0)"

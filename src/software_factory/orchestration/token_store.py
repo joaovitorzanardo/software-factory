@@ -14,6 +14,8 @@ from software_factory.orchestration.token_usage import (
     session_share,
 )
 
+SCHEMA_VERSION = 1
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions(
     key TEXT PRIMARY KEY, issue_id TEXT NOT NULL, stage TEXT NOT NULL,
@@ -68,13 +70,18 @@ class TokenStore:
         self._path = path
         with closing(sqlite3.connect(path)) as conn, conn:
             conn.executescript(_SCHEMA)
+            # Gancho para migrações futuras; PRAGMA não aceita parâmetros.
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def record(self, record: SessionRecord) -> None:
         """Grava a sessão; a mesma chave de novo é ignorada (retry da activity)."""
         usage = record.usage
         with closing(sqlite3.connect(self._path)) as conn, conn:
             inserted = conn.execute(
-                "INSERT OR IGNORE INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT OR IGNORE INTO sessions(key, issue_id, stage, workflow_id, run_id, activity,"
+                " attempt, recorded_at, model, complete, input_tokens, output_tokens,"
+                " cache_creation_tokens, cache_read_tokens, cost_usd)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     record.key, record.issue_id, record.stage, record.workflow_id,
                     record.run_id, record.activity, record.attempt, record.recorded_at,

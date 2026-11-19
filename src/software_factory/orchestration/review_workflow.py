@@ -180,6 +180,7 @@ class ReviewIssueWorkflow(SessionWorkflow):
             )
             if pull is None:
                 workflow.logger.info("%s sem PR aberta", issue.identifier)
+                await publish_token_usage(issue.issue_id)
                 return ReviewResult(issue.identifier, OUTCOME_NO_PR, follow_ups=tuple(follow_ups))
             if fix_rounds >= MAX_REVIEW_ROUNDS:
                 question = review_stuck_question(fix_rounds, rounds[-1])

@@ -1,8 +1,9 @@
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
-from software_factory.orchestration.token_store import SessionRecord, TokenStore
+from software_factory.orchestration.token_store import SCHEMA_VERSION, SessionRecord, TokenStore
 from software_factory.orchestration.token_usage import (
     IssueUsage,
     SessionUsage,
@@ -34,6 +35,11 @@ class TestTokenStore(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.path = str(Path(self._tmp.name) / "t.db")
         self.store = TokenStore(self.path)
+
+    def test_new_database_has_schema_version(self) -> None:
+        conn = sqlite3.connect(self.path)
+        self.addCleanup(conn.close)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
 
     def test_accumulates_sessions_per_stage(self) -> None:
         self.store.record(record("a", "implement", usage(10)))

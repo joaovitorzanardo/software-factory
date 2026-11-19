@@ -74,18 +74,18 @@ src/software_factory/
                       # MoveIssueRequest, PlanResult, CloneBranchRequest, ImplementRequest, TestRunResult,
                       # CommitImplementationRequest, PullRequestRequest, ImplementResult e, do loop de correção,
                       # FixAttempt, Clarification, AnalyzeRequest, FixAnalysis, FixRequest, CommentRequest,
-                      # HumanAnswer, UsageAlert), STATE_* e OUTCOME_*
+                      # HumanAnswer, UsageAlert, UsageReportRequest), STATE_* e OUTCOME_*
     activities.py     # SandboxActivities: create_sandbox, clone_repo, generate_plan, commit_plan,
                       # clone_branch, implement_plan, analyze_failure, implement_fix, run_tests,
                       # commit_implementation, kill_sandbox; install_skills (copia orchestration/skills/);
-                      # _run_claude (sessão do Claude + aviso de uso)
+                      # _run_claude (sessão do Claude + aviso de uso + registro de tokens)
     usage.py          # session_usage, UsageWatcher (rate_limit_event → UsageAlert), usage_alert_workflow_id
     notify_activities.py  # NotifyActivities.send_usage_alert; UsageAlertNotifier (inicia o workflow, dedup)
     usage_alert_workflow.py  # UsageAlertWorkflow: envia o email de 80% da sessão (retry do Temporal)
     token_usage.py    # TokenMeter (stream-json → tokens, custo, modelo, amostras da janela), session_share,
                       # StageUsage/IssueUsage, render_usage_comment, stage_for_workflow, token_usage_comment_id
     token_store.py    # TokenStore (SQLite), SessionRecord; tabelas `sessions` e `session_windows`
-    token_activities.py   # TokenUsageActivities.token_usage_report (lê o SQLite e monta o IssueUsage)
+    token_activities.py   # TokenUsageActivities.token_usage_report (lê o SQLite e devolve o texto do comentário, `render_usage_comment`)
     token_reporting.py    # publish_token_usage: helper dos workflows (report → upsert_comment; falha só loga)
     linear_activities.py  # LinearActivities: move_issue (muda o status por nome, no time da issue),
                           # post_comment, upsert_comment (cria ou edita pelo id) e create_issue (idempotentes,
@@ -196,12 +196,15 @@ tests/                # unittest; payloads.py tem fixtures no formato do Linear
   falha sem retry. Em falha não há compensação: a issue fica em `In Planning`.
 - **Relatório de tokens:** toda sessão do Claude (menos `run_tests`) grava um `SessionRecord` no SQLite
   (`SandboxActivities` recebe o `token_store`): input, output, cache write, cache read, custo estimado,
-  modelo e as amostras da janela `five_hour`. Etapas: planejamento = `Planejamento`; análise e correção
-  do loop de testes vermelhos = `Implementação`; correções feitas na review = `Review`. Um comentário por
+  modelo e as amostras da janela `five_hour`. A etapa é o prefixo do id do workflow: `plan-issue-` →
+  `Planejamento` (`generate_plan`); `implement-issue-` → `Implementação` (`implement_plan`,
+  `analyze_failure`, `implement_fix`); `review-issue-` → `Review` (lentes, triagem, `implement_review_fix` e
+  o loop analisar/corrigir quando roda dentro da review). `run_tests` não é contado. Um comentário por
   issue no Linear (`upsert_comment`) é criado ou editado com os totais por etapa, publicado
   (`publish_token_usage`) depois do commit do plano (antes de `In Progress`), depois de abrir a PR
   (antes de `In Review`), ao parar a implementação, no merge (depois de `Done`, com `final=True`, que
-  acrescenta a linha `Total:`) e ao parar a review. Workflow que falha não publica, mas os registros
+  acrescenta a linha `Total:`) e ao parar a review. A linha `Total:` só aparece no merge → `Done` feito pela fábrica; issue movida para
+  `Done` à mão sai da review pelo caminho de parada, sem o `Total:`. Workflow que falha não publica, mas os registros
   ficam no banco e entram na próxima publicação; falha na publicação só loga warning. Id do comentário:
   UUID v4-format derivado de `sha256("token-usage:" + issue_id)`, então os três workflows acham o mesmo
   comentário. **% da janela:** a parcela da sessão é, por `resetsAt` da `five_hour`, `max(last) -

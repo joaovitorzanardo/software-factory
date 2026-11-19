@@ -507,6 +507,13 @@ class TestReviewIssueWorkflow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, ReviewResult("ENG-12", "no_pr"))
         self.assertNotIn("create_sandbox", fake.calls)
 
+    async def test_no_pr_publishes_token_usage(self) -> None:
+        fake = FakeReviewActivities(pull_missing=True)
+        await self.run_workflow(fake)
+        self.assertEqual(
+            fake.calls[-2:], ["token_usage_report:final=False", "upsert_comment"]
+        )
+
     async def test_merge_blocked_asks_human_then_retries(self) -> None:
         fake = FakeReviewActivities(
             merges=[MergeResult(False, reason="não mergeável (dirty)"), MergeResult(True)],
