@@ -32,7 +32,7 @@
 - O `init` traz `model`.
 - O uso de UUID v5 como id de comentário no Linear não foi testado: a decisão acima usa o formato v4.
 
-
+## Global Constraints
 
 - Nenhuma dependência de pacote nova (`sqlite3`, `uuid`, `asyncio.to_thread` da stdlib).
 - Workflows determinísticos: SQLite e Linear só em activities; o id do comentário (hash puro) pode ser calculado no workflow.
@@ -40,8 +40,8 @@
 - Env nova do worker: `TOKEN_USAGE_DB` (default `token_usage.db`).
 - Números em pt-BR: milhar com `.` (`1.234.567`), percentual com uma casa e vírgula (`3,2%`), custo `US$ 0,84`.
 - Logs, comentário e docs em português.
-- Testes: `PYTHONPATH=src python3 -m unittest discover -s tests`.
-- Trabalhar numa branch nova a partir de `main`: `feat/token-usage-report`.
+- Testes: `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests` (o python do sistema não tem as dependências).
+- Branch `feat/token-usage-report`, criada a partir de `feat/session-usage-alert`.
 
 ## Review Focus
 
