@@ -66,6 +66,7 @@ async def run_worker(settings: FactorySettings) -> None:
             review.implement_review_fix,
             linear.move_issue,
             linear.post_comment,
+            linear.upsert_comment,
             linear.create_issue,
             github.plan_exists,
             github.open_pull_request,

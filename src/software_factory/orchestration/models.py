@@ -128,7 +128,7 @@ class FixRequest:
 @dataclass(frozen=True)
 class CommentRequest:
     issue_id: str
-    # UUID v4 gerado no workflow: idempotência.
+    # UUID gerado pelo chamador: idempotência (post_comment cria uma vez; upsert_comment edita).
     comment_id: str
     body: str
 
