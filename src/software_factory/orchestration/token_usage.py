@@ -167,3 +167,18 @@ def token_usage_comment_id(issue_id: str) -> str:
     """UUID v4 determinístico do comentário de tokens da issue (o Linear exige v4)."""
     digest = hashlib.sha256(f"token-usage:{issue_id}".encode()).digest()[:16]
     return str(uuid.UUID(bytes=digest, version=4))
+
+
+@dataclass(frozen=True)
+class StageUsage:
+    tokens: TokenCounts
+    cost_usd: float | None  # soma dos custos conhecidos; None se nenhuma sessão tem custo
+    share: float | None  # fatia da janela de 5h (0 a 1); None sem amostras
+    sessions: int
+    partial: bool  # alguma sessão sem `result` (contagem estimada)
+
+
+@dataclass(frozen=True)
+class IssueUsage:
+    stages: dict[str, StageUsage]  # só etapas com sessão, na ordem de STAGE_LABELS
+    total: StageUsage | None  # None sem sessões

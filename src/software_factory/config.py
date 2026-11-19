@@ -54,6 +54,8 @@ class FactorySettings:
     e2b_template: str = "claude"
     # SMTP do aviso de 80% da sessão do Claude; None = aviso desligado (sem SMTP_HOST).
     alert_email: EmailSettings | None = None
+    # SQLite com o uso de tokens por sessão do Claude.
+    token_usage_db: str = "token_usage.db"
 
     def __post_init__(self) -> None:
         if bool(self.anthropic_api_key) == bool(self.claude_code_oauth_token):
@@ -81,4 +83,5 @@ class FactorySettings:
             task_queue=os.environ.get("TASK_QUEUE", DEFAULT_TASK_QUEUE),
             e2b_template=os.environ.get("E2B_TEMPLATE", "claude"),
             alert_email=EmailSettings.from_env(),
+            token_usage_db=os.environ.get("TOKEN_USAGE_DB", "token_usage.db"),
         )
