@@ -5,10 +5,14 @@ import uuid
 
 from software_factory.orchestration.token_usage import (
     STAGE_IMPLEMENT,
+    STAGE_PLAN,
+    IssueUsage,
     SessionUsage,
+    StageUsage,
     TokenCounts,
     TokenMeter,
     WindowSample,
+    render_usage_comment,
     session_share,
     stage_for_workflow,
     token_usage_comment_id,
@@ -111,3 +115,46 @@ class TestIds(unittest.TestCase):
         self.assertEqual(token_usage_comment_id("a"), token_usage_comment_id("a"))
         self.assertNotEqual(token_usage_comment_id("a"), token_usage_comment_id("b"))
         self.assertEqual(uuid.UUID(token_usage_comment_id("a")).version, 4)
+
+
+def stage(total: int, share: float | None, cost: float | None, partial: bool = False) -> StageUsage:
+    return StageUsage(TokenCounts(input_tokens=total), cost, share, 1, partial)
+
+
+class TestRenderUsageComment(unittest.TestCase):
+    def usage(self) -> IssueUsage:
+        plan = StageUsage(TokenCounts(45_000, 18_000, 60_000, 1_111_567), 0.84, 0.032, 1, False)
+        impl = StageUsage(TokenCounts(4_800_000), 3.10, 0.14, 2, True)
+        total = StageUsage(plan.tokens + impl.tokens, 3.94, 0.172, 3, True)
+        return IssueUsage({STAGE_PLAN: plan, STAGE_IMPLEMENT: impl}, total)
+
+    def test_render_stages_in_order(self) -> None:
+        text = render_usage_comment(self.usage(), final=False)
+        plan_line = "Planejamento: 1.234.567 tokens · 3,2% da sessão · US$ 0,84"
+        self.assertIn(plan_line, text)
+        self.assertIn("Implementação: 4.800.000 tokens (parcial) · 14,0% da sessão · US$ 3,10", text)
+        self.assertLess(text.index(plan_line), text.index("Implementação:"))
+        self.assertNotIn("Total", text)
+        self.assertIn("| Planejamento | 1 | 45.000 | 60.000 | 1.111.567 | 18.000 | US$ 0,84 |", text)
+
+    def test_render_final_adds_total(self) -> None:
+        text = render_usage_comment(self.usage(), final=True)
+        self.assertIn("Total: 6.034.567 tokens (parcial) · 17,2% da sessão · US$ 3,94", text)
+        self.assertIn("| Total | 3 |", text)
+
+    def test_render_without_share_or_cost(self) -> None:
+        usage = IssueUsage({STAGE_PLAN: stage(1000, None, None)}, None)
+        text = render_usage_comment(usage, final=False)
+        self.assertIn("Planejamento: 1.000 tokens\n", text)
+        self.assertNotIn("·", text)
+        self.assertIn("| — |", text)
+
+    def test_render_partial(self) -> None:
+        usage = IssueUsage({STAGE_PLAN: stage(5, None, None, partial=True)}, None)
+        self.assertIn("Planejamento: 5 tokens (parcial)", render_usage_comment(usage, final=False))
+
+    def test_render_empty(self) -> None:
+        self.assertEqual(
+            render_usage_comment(IssueUsage({}, None), final=True),
+            "**Tokens gastos pela factory**\n\nNenhuma sessão do Claude registrada.",
+        )

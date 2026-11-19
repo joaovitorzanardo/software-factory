@@ -182,3 +182,57 @@ class StageUsage:
 class IssueUsage:
     stages: dict[str, StageUsage]  # só etapas com sessão, na ordem de STAGE_LABELS
     total: StageUsage | None  # None sem sessões
+
+
+def _int(value: int) -> str:
+    return f"{value:,}".replace(",", ".")
+
+
+def _usd(value: float) -> str:
+    return "US$ " + f"{value:,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
+
+
+def _summary_line(label: str, stage: StageUsage) -> str:
+    line = f"{label}: {_int(stage.tokens.total)} tokens"
+    if stage.partial:
+        line += " (parcial)"
+    if stage.share is not None:
+        line += f" · {f'{stage.share * 100:.1f}'.replace('.', ',')}% da sessão"
+    if stage.cost_usd is not None:
+        line += f" · {_usd(stage.cost_usd)}"
+    return line
+
+
+def _table_row(label: str, stage: StageUsage) -> str:
+    t = stage.tokens
+    cost = _usd(stage.cost_usd) if stage.cost_usd is not None else "—"
+    cells = [
+        label,
+        str(stage.sessions),
+        _int(t.input_tokens),
+        _int(t.cache_creation_tokens),
+        _int(t.cache_read_tokens),
+        _int(t.output_tokens),
+        cost,
+    ]
+    return "| " + " | ".join(cells) + " |"
+
+
+def render_usage_comment(usage: IssueUsage, final: bool) -> str:
+    """Texto do comentário de tokens no Linear; a linha `Total` só com `final`."""
+    title = "**Tokens gastos pela factory**"
+    if not usage.stages:
+        return f"{title}\n\nNenhuma sessão do Claude registrada."
+    rows = [(STAGE_LABELS[name], stage) for name, stage in usage.stages.items()]
+    if final and usage.total is not None:
+        rows.append(("Total", usage.total))
+    header = [
+        "| Etapa | Sessões | Input | Cache (escrita) | Cache (leitura) | Output | Custo |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    lines = [title, ""]
+    lines += [_summary_line(label, stage) for label, stage in rows]
+    lines += ["", "+++ Detalhes", ""] + header
+    lines += [_table_row(label, stage) for label, stage in rows]
+    lines += ["", "+++"]
+    return "\n".join(lines)
