@@ -39,6 +39,7 @@ from software_factory.orchestration.models import (
     PlanIssueInput,
     PlanRequest,
     TestRunResult,
+    UsageAlert,
 )
 
 SETTINGS = FactorySettings(
@@ -162,6 +163,28 @@ def stream(*events: dict[str, Any]) -> str:
     return "\n".join(json.dumps(event) for event in events) + "\n"
 
 
+USAGE_RESET = 1795440000
+USAGE_EVENT = {
+    "type": "rate_limit_event",
+    "rate_limit_info": {
+        "status": "allowed_warning",
+        "unifiedWindows": {"five_hour": {"utilization": 0.85, "resetsAt": USAGE_RESET}},
+    },
+}
+
+
+class FakeNotifier:
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error
+        self.alerts: list[UsageAlert] = []
+
+    async def notify(self, alert: UsageAlert) -> bool:
+        self.alerts.append(alert)
+        if self.error:
+            raise self.error
+        return True
+
+
 class TestFactorySettings(unittest.TestCase):
     def test_requires_exactly_one_claude_auth(self) -> None:
         with self.assertRaises(RuntimeError):
@@ -196,6 +219,28 @@ class TestFactorySettings(unittest.TestCase):
                 FactorySettings.from_env()
         with mock.patch.dict(os.environ, {**env, "TEST_COMMAND": "make test"}, clear=True):
             self.assertEqual(FactorySettings.from_env().test_command, "make test")
+
+    def test_alert_email_optional(self) -> None:
+        env = {
+            "E2B_API_KEY": "e2b-key",
+            "ANTHROPIC_API_KEY": "anthropic-key",
+            "GITHUB_TOKEN": "gh-token",
+            "TARGET_REPO": "acme/app",
+            "LINEAR_API_KEY": "lin-key",
+            "TEST_COMMAND": "make test",
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertIsNone(FactorySettings.from_env().alert_email)
+        smtp = {
+            "SMTP_HOST": "smtp.example.com",
+            "SMTP_USERNAME": "bot@example.com",
+            "SMTP_PASSWORD": "pw",
+            "ALERT_EMAIL_TO": "dev@example.com",
+        }
+        with mock.patch.dict(os.environ, {**env, **smtp}, clear=True):
+            alert_email = FactorySettings.from_env().alert_email
+            assert alert_email is not None
+            self.assertEqual(alert_email.host, "smtp.example.com")
 
 
 class TestBuildPlanPrompt(unittest.TestCase):
@@ -504,6 +549,65 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
             await self.env.run(
                 self.activities.implement_plan, ImplementRequest(sandbox_id="sbx-1", issue=ISSUE)
             )
+
+    def with_notifier(self, notifier: FakeNotifier) -> SandboxActivities:
+        return SandboxActivities(SETTINGS, sandbox_cls=FakeSandbox, usage_notifier=notifier)
+
+    async def test_implement_plan_notifies_usage(self) -> None:
+        notifier = FakeNotifier()
+        FakeSandbox.instance.commands.stdout = stream(
+            USAGE_EVENT, {"type": "result", "subtype": "success", "result": "Implementado."}
+        )
+        result = await self.env.run(
+            self.with_notifier(notifier).implement_plan,
+            ImplementRequest(sandbox_id="sbx-1", issue=ISSUE),
+        )
+        self.assertEqual(result, "Implementado.")
+        source = f"{self.env.info.workflow_id}/{self.env.info.activity_type}"
+        self.assertEqual(notifier.alerts, [UsageAlert("five_hour", 0.85, USAGE_RESET, source)])
+
+    async def test_usage_notifier_failure_does_not_fail_session(self) -> None:
+        notifier = FakeNotifier(RuntimeError("temporal fora"))
+        FakeSandbox.instance.commands.stdout = stream(
+            USAGE_EVENT, {"type": "result", "subtype": "success", "result": "Implementado."}
+        )
+        result = await self.env.run(
+            self.with_notifier(notifier).implement_plan,
+            ImplementRequest(sandbox_id="sbx-1", issue=ISSUE),
+        )
+        self.assertEqual(result, "Implementado.")
+        self.assertEqual(len(notifier.alerts), 1)
+
+    async def test_usage_watcher_error_does_not_fail_session(self) -> None:
+        notifier = FakeNotifier()
+        FakeSandbox.instance.commands.stdout = stream(
+            USAGE_EVENT, {"type": "result", "subtype": "success", "result": "Ok."}
+        )
+        with mock.patch(
+            "software_factory.orchestration.activities.UsageWatcher.feed",
+            side_effect=RecursionError("json aninhado"),
+        ):
+            result = await self.env.run(
+                self.with_notifier(notifier).implement_plan,
+                ImplementRequest(sandbox_id="sbx-1", issue=ISSUE),
+            )
+        self.assertEqual(result, "Ok.")
+
+    async def test_run_tests_not_watched(self) -> None:
+        notifier = FakeNotifier()
+        FakeSandbox.instance.commands.stdout = stream(USAGE_EVENT)
+        result = await self.env.run(self.with_notifier(notifier).run_tests, "sbx-1")
+        self.assertTrue(result.passed)
+        self.assertEqual(notifier.alerts, [])
+
+    async def test_no_notifier(self) -> None:
+        FakeSandbox.instance.commands.stdout = stream(
+            USAGE_EVENT, {"type": "result", "subtype": "success", "result": "Implementado."}
+        )
+        result = await self.env.run(
+            self.activities.implement_plan, ImplementRequest(sandbox_id="sbx-1", issue=ISSUE)
+        )
+        self.assertEqual(result, "Implementado.")
 
     async def test_run_tests_green(self) -> None:
         FakeSandbox.instance.commands.stdout = "5 passed"

@@ -38,6 +38,12 @@ Software factory experimental (fase de teste). O objetivo é automatizar o ciclo
   `orchestration/skills/` (MIT) e copiada para `~/.claude/skills/` no sandbox — sem instalar plugin via rede.
 - **Correção de testes vermelhos:** skill `systematic-debugging` do superpowers 7.0.2, vendorizada
   ao lado (MIT); `install_skills` copia tudo que está em `orchestration/skills/`.
+- **Aviso de uso da sessão:** email por SMTP com `smtplib` (stdlib, STARTTLS; ex.: Gmail com senha
+  de app), opcional (sem `SMTP_HOST` fica desligado). Só com `CLAUDE_CODE_OAUTH_TOKEN`: toda sessão do
+  Claude (menos `run_tests`) lê os `rate_limit_event` do stream-json e, com a janela `five_hour` em
+  ≥ 80%, inicia o `UsageAlertWorkflow` com id `usage-alert-five-hour-<resetsAt>` e
+  `ALLOW_DUPLICATE_FAILED_ONLY` (um email por janela, sem persistência; um run que falhou deixa a
+  próxima travessia tentar de novo). Erro no aviso nunca derruba a sessão.
 
 Ainda **não definidos** (não assumir sem confirmar com o usuário): persistência e deploy. Ao introduzir qualquer tecnologia nova,
 pergunte antes e atualize esta seção.
@@ -57,6 +63,8 @@ src/software_factory/
                       # CommentReply e parse_reply (reply de comentário → HumanAnswer)
     webhook.py        # POST /webhooks/linear; handle_issue inicia o PlanIssueWorkflow, o ImplementIssueWorkflow ou o
                       # ReviewIssueWorkflow; handle_reply envia o signal human_answer aos workflows de implementação e review
+  notify/
+    email.py          # EmailSettings (SMTP_*, ALERT_EMAIL_*, ALERT_TIMEZONE), build_usage_alert_email, send_email
   github/
     client.py         # GitHubClient: REST com httpx (default_branch, get_file, find_open_pull, create_pull)
   orchestration/
@@ -64,10 +72,14 @@ src/software_factory/
                       # MoveIssueRequest, PlanResult, CloneBranchRequest, ImplementRequest, TestRunResult,
                       # CommitImplementationRequest, PullRequestRequest, ImplementResult e, do loop de correção,
                       # FixAttempt, Clarification, AnalyzeRequest, FixAnalysis, FixRequest, CommentRequest,
-                      # HumanAnswer), STATE_* e OUTCOME_*
+                      # HumanAnswer, UsageAlert), STATE_* e OUTCOME_*
     activities.py     # SandboxActivities: create_sandbox, clone_repo, generate_plan, commit_plan,
                       # clone_branch, implement_plan, analyze_failure, implement_fix, run_tests,
-                      # commit_implementation, kill_sandbox; install_skills (copia orchestration/skills/)
+                      # commit_implementation, kill_sandbox; install_skills (copia orchestration/skills/);
+                      # _run_claude (sessão do Claude + aviso de uso)
+    usage.py          # session_usage, UsageWatcher (rate_limit_event → UsageAlert), usage_alert_workflow_id
+    notify_activities.py  # NotifyActivities.send_usage_alert; UsageAlertNotifier (inicia o workflow, dedup)
+    usage_alert_workflow.py  # UsageAlertWorkflow: envia o email de 80% da sessão (retry do Temporal)
     linear_activities.py  # LinearActivities: move_issue (muda o status por nome, no time da issue),
                           # post_comment e create_issue (idempotentes, com UUID gerado pelo cliente)
     review_activities.py  # ReviewActivities(sandbox): review_pull (duas lentes + triagem), implement_review_fix
@@ -197,7 +209,8 @@ uv venv .venv && source .venv/bin/activate && uv pip install -e ".[dev]"
 # servidor Temporal local (terminal separado) — gRPC localhost:7233, UI http://localhost:8233
 temporal server start-dev --db-filename temporal.db
 
-# worker do Temporal (lê .env; precisa de E2B_API_KEY, ANTHROPIC_API_KEY ou CLAUDE_CODE_OAUTH_TOKEN, GITHUB_TOKEN, TARGET_REPO, LINEAR_API_KEY, TEST_COMMAND)
+# worker do Temporal (lê .env; precisa de E2B_API_KEY, ANTHROPIC_API_KEY ou CLAUDE_CODE_OAUTH_TOKEN, GITHUB_TOKEN, TARGET_REPO, LINEAR_API_KEY, TEST_COMMAND;
+# opcional: SMTP_HOST, SMTP_USERNAME, SMTP_PASSWORD, ALERT_EMAIL_TO para o aviso de uso)
 software-factory-worker
 
 # servidor de webhooks (lê .env)

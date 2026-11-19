@@ -277,3 +277,13 @@ class ReconcileResult:
     # Workflow ids iniciados.
     started: list[str]
     skipped: int
+
+
+@dataclass(frozen=True)
+class UsageAlert:
+    """Janela de uso da assinatura do Claude que passou do limiar de aviso."""
+
+    window: str
+    utilization: float
+    resets_at: int  # epoch em segundos
+    source: str = ""  # <workflow_id>/<activity> que detectou

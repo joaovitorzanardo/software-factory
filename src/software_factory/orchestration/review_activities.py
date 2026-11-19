@@ -12,7 +12,6 @@ from software_factory.orchestration.activities import (
     IMPLEMENT_COMMAND_TIMEOUT_S,
     REPO_DIR,
     SandboxActivities,
-    _run_with_heartbeat,
     install_skills,
     parse_result,
 )
@@ -97,7 +96,7 @@ class ReviewActivities:
 
         lenses = [
             asyncio.create_task(
-                _run_with_heartbeat(sandbox, review_lens_command(path), REVIEW_LENS_TIMEOUT_S)
+                self.sandbox._run_claude(sandbox, review_lens_command(path), REVIEW_LENS_TIMEOUT_S)
             )
             for path in (CORRECTNESS_PROMPT_PATH, SECURITY_PROMPT_PATH)
         ]
@@ -113,7 +112,7 @@ class ReviewActivities:
             if not await sandbox.files.exists(path):
                 raise ApplicationError(f"Claude Code não salvou o relatório em {path}")
 
-        result = await _run_with_heartbeat(
+        result = await self.sandbox._run_claude(
             sandbox, review_triage_command(), REVIEW_TRIAGE_TIMEOUT_S
         )
         parse_result(result.stdout)
@@ -134,7 +133,7 @@ class ReviewActivities:
             REVIEW_FIX_PROMPT_PATH,
             build_review_fix_prompt(request, self.sandbox.settings.test_command),
         )
-        result = await _run_with_heartbeat(
+        result = await self.sandbox._run_claude(
             sandbox, review_fix_command(), IMPLEMENT_COMMAND_TIMEOUT_S
         )
         return parse_result(result.stdout)

@@ -122,6 +122,22 @@ temporal operator namespace update --namespace default --retention 30d
 | `TARGET_REPO` | worker | repo que a fábrica opera (`owner/repo`) |
 | `TEST_COMMAND` | worker | comando que roda os testes do repo alvo no sandbox (exit 0 = verde), ex.: `uv pip install --system -e ".[dev]" && python -m pytest` |
 | `LINEAR_API_KEY` | worker | personal API key do Linear, com escrita em issues (muda o status) |
+| `SMTP_HOST` | worker | opcional: servidor SMTP do aviso de uso (ex.: `smtp.gmail.com`); sem ele o aviso fica desligado |
+| `SMTP_PORT` | worker | porta SMTP com STARTTLS (default `587`) |
+| `SMTP_USERNAME` / `SMTP_PASSWORD` | worker | login SMTP (no Gmail, senha de app; exige 2FA); obrigatórias com `SMTP_HOST` |
+| `ALERT_EMAIL_FROM` | worker | remetente do aviso (default `SMTP_USERNAME`) |
+| `ALERT_EMAIL_TO` | worker | destinatário do aviso; obrigatória com `SMTP_HOST` |
+| `ALERT_TIMEZONE` | worker | fuso do horário do reset no email (default `America/Sao_Paulo`) |
+
+### Aviso de uso da sessão do Claude
+
+Com `CLAUDE_CODE_OAUTH_TOKEN` e `SMTP_HOST` configurados, o worker lê os eventos `rate_limit_event`
+que o Claude Code emite no stream-json de toda sessão (planejamento, implementação, análise, correção
+e review). Quando a janela de 5 horas da assinatura passa de 80%, ele manda um email com o percentual
+e o horário em que o limite reseta. Sai um email por janela, mesmo com várias sessões em paralelo:
+o `UsageAlertWorkflow` tem id `usage-alert-five-hour-<resetsAt>` e o Temporal recusa o segundo.
+Limitações: com `ANTHROPIC_API_KEY` não há sessão e o aviso não dispara; a saída de `TEST_COMMAND`
+não é monitorada; um retry do envio depois de um SMTP que deu certo pode duplicar o email.
 
 ## Worker (Temporal + E2B)
 
