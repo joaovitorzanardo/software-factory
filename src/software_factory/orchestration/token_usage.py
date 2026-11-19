@@ -98,12 +98,17 @@ class TokenMeter:
     def feed(self, chunk: str) -> None:
         *lines, self._pending = (self._pending + chunk).split("\n")
         for line in lines:
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(event, dict):
-                self._handle(event)
+            self._parse(line)
+
+    def _parse(self, line: str) -> bool:
+        """False se a linha não é JSON válido (pode estar incompleta)."""
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return False
+        if isinstance(event, dict):
+            self._handle(event)
+        return True
 
     def _handle(self, event: dict[str, Any]) -> None:
         kind = event.get("type")
@@ -129,6 +134,10 @@ class TokenMeter:
                 self._windows[resets_at] = WindowSample(resets_at, first, utilization)
 
     def usage(self) -> SessionUsage | None:
+        # A última linha (o `result`) pode chegar sem "\n": se já é um JSON completo, processa
+        # uma vez e limpa o buffer; se ainda está incompleta, segue no buffer.
+        if self._pending and self._parse(self._pending):
+            self._pending = ""
         if self._result is None and not self._assistant and not self._windows:
             return None
         if self._result is not None:

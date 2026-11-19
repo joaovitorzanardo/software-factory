@@ -77,6 +77,12 @@ class TestTokenMeter(unittest.TestCase):
         meter.feed(text[40:])
         self.assertEqual(meter.usage().tokens.output_tokens, 175)
 
+    def test_usage_processes_unterminated_last_line(self) -> None:
+        meter = TokenMeter()
+        meter.feed(json.dumps(RESULT_EVENT))  # sem "\n" final
+        self.assertEqual(meter.usage().tokens.output_tokens, 175)
+        self.assertEqual(meter.usage().tokens.output_tokens, 175)  # segunda chamada é segura
+
     def test_tracks_first_and_last_utilization_per_window(self) -> None:
         meter = TokenMeter()
         meter.feed(stream(rate_limit(0.30, 100), rate_limit(0.35, 100), rate_limit(0.02, 200)))

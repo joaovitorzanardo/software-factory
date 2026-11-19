@@ -9,6 +9,7 @@ from software_factory.config import FactorySettings
 from software_factory.github.client import GitHubClient
 from software_factory.linear.client import LinearClient
 from software_factory.orchestration.activities import SandboxActivities
+from software_factory.orchestration.token_store import TokenStore
 from software_factory.orchestration.github_activities import GitHubActivities
 from software_factory.orchestration.implement_workflow import ImplementIssueWorkflow
 from software_factory.orchestration.linear_activities import LinearActivities
@@ -38,7 +39,8 @@ async def run_worker(settings: FactorySettings) -> None:
         alert_activities.append(NotifyActivities(settings.alert_email).send_usage_alert)
     else:
         logger.info("aviso de uso desligado: SMTP_HOST não definida")
-    activities = SandboxActivities(settings, usage_notifier=notifier)
+    token_store = TokenStore(settings.token_usage_db)
+    activities = SandboxActivities(settings, usage_notifier=notifier, token_store=token_store)
     review = ReviewActivities(activities)
     linear_client = LinearClient(settings.linear_api_key)
     linear = LinearActivities(linear_client)

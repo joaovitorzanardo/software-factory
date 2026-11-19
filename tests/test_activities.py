@@ -1,5 +1,7 @@
 import json
 import os
+import sqlite3
+import tempfile
 import unittest
 from dataclasses import dataclass, field, replace
 from typing import Any, Awaitable, Callable
@@ -26,6 +28,7 @@ from software_factory.orchestration.activities import (
     build_plan_prompt,
     plan_path,
 )
+from software_factory.orchestration.token_store import TokenStore
 from software_factory.orchestration.models import (
     AnalyzeRequest,
     CloneBranchRequest,
@@ -41,6 +44,8 @@ from software_factory.orchestration.models import (
     TestRunResult,
     UsageAlert,
 )
+from software_factory.orchestration.token_usage import TokenCounts
+from tests.stream_samples import INIT_EVENT, ASSISTANT_EVENT, RESULT_EVENT
 
 SETTINGS = FactorySettings(
     e2b_api_key="e2b-key",
@@ -171,6 +176,9 @@ USAGE_EVENT = {
         "unifiedWindows": {"five_hour": {"utilization": 0.85, "resetsAt": USAGE_RESET}},
     },
 }
+
+
+RESULT_EVENT_OK = {**RESULT_EVENT, "subtype": "success", "result": "Ok.", "is_error": False}
 
 
 class FakeNotifier:
@@ -606,6 +614,87 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
                 ImplementRequest(sandbox_id="sbx-1", issue=ISSUE),
             )
         self.assertEqual(result, "Ok.")
+
+    def with_store(
+        self, store: TokenStore, workflow_id: str = "implement-issue-abc", **kwargs: Any
+    ) -> tuple[SandboxActivities, ActivityEnvironment]:
+        env = ActivityEnvironment()
+        env.info = replace(env.info, workflow_id=workflow_id)
+        activities = SandboxActivities(
+            SETTINGS, sandbox_cls=FakeSandbox, token_store=store, **kwargs
+        )
+        return activities, env
+
+    def new_store(self) -> TokenStore:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return TokenStore(os.path.join(tmp.name, "tokens.db"))
+
+    async def test_records_session_usage(self) -> None:
+        store = self.new_store()
+        FakeSandbox.instance.commands.stdout = stream(
+            INIT_EVENT, ASSISTANT_EVENT, RESULT_EVENT_OK
+        )
+        activities, env = self.with_store(store)
+        await env.run(
+            activities.implement_plan, ImplementRequest(sandbox_id="sbx-1", issue=ISSUE)
+        )
+        usage = store.issue_usage("abc")
+        self.assertEqual(usage.stages["implement"].tokens, TokenCounts(4, 175, 40261, 37118))
+        self.assertFalse(usage.stages["implement"].partial)
+
+    async def test_records_usage_when_session_times_out(self) -> None:
+        store = self.new_store()
+        FakeSandbox.instance.commands.stdout = stream(INIT_EVENT, ASSISTANT_EVENT)
+
+        def time_out(cmd: str) -> None:
+            raise TimeoutException("context deadline exceeded")
+
+        FakeSandbox.instance.commands.on_run = time_out
+        activities, env = self.with_store(store)
+        with self.assertRaises(TimeoutException):
+            await env.run(
+                activities.implement_plan, ImplementRequest(sandbox_id="sbx-1", issue=ISSUE)
+            )
+        self.assertTrue(store.issue_usage("abc").stages["implement"].partial)
+
+    async def test_store_error_does_not_fail_session(self) -> None:
+        store = self.new_store()
+        FakeSandbox.instance.commands.stdout = stream(
+            INIT_EVENT, ASSISTANT_EVENT, RESULT_EVENT_OK
+        )
+        activities, env = self.with_store(store)
+        with mock.patch.object(store, "record", side_effect=sqlite3.OperationalError("locked")):
+            result = await env.run(
+                activities.implement_plan, ImplementRequest(sandbox_id="sbx-1", issue=ISSUE)
+            )
+        self.assertEqual(result, "Ok.")
+
+    async def test_no_record_outside_issue_workflow(self) -> None:
+        store = self.new_store()
+        FakeSandbox.instance.commands.stdout = stream(
+            INIT_EVENT, ASSISTANT_EVENT, RESULT_EVENT_OK
+        )
+        activities, env = self.with_store(store, workflow_id="outro-x")
+        with mock.patch.object(store, "record") as record:
+            result = await env.run(
+                activities.implement_plan, ImplementRequest(sandbox_id="sbx-1", issue=ISSUE)
+            )
+        self.assertEqual(result, "Ok.")
+        record.assert_not_called()
+
+    async def test_usage_alert_still_fires(self) -> None:
+        store = self.new_store()
+        notifier = FakeNotifier()
+        FakeSandbox.instance.commands.stdout = stream(
+            USAGE_EVENT, {"type": "result", "subtype": "success", "result": "Ok."}
+        )
+        activities, env = self.with_store(store, usage_notifier=notifier)
+        await env.run(
+            activities.implement_plan, ImplementRequest(sandbox_id="sbx-1", issue=ISSUE)
+        )
+        self.assertEqual(len(notifier.alerts), 1)
+        self.assertEqual(store.issue_usage("abc").stages["implement"].tokens, TokenCounts())
 
     async def test_run_tests_not_watched(self) -> None:
         notifier = FakeNotifier()

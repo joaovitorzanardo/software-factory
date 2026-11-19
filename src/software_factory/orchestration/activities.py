@@ -1,6 +1,8 @@
 import asyncio
 import json
 import re
+import uuid
+from datetime import UTC, datetime
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -11,6 +13,8 @@ from temporalio.exceptions import ApplicationError
 
 from software_factory.config import FactorySettings
 from software_factory.orchestration.notify_activities import UsageAlertNotifier
+from software_factory.orchestration.token_store import SessionRecord, TokenStore
+from software_factory.orchestration.token_usage import TokenMeter, stage_for_workflow
 from software_factory.orchestration.usage import UsageWatcher
 from software_factory.orchestration.models import (
     AnalyzeRequest,
@@ -283,22 +287,29 @@ class SandboxActivities:
         settings: FactorySettings,
         sandbox_cls: Any = AsyncSandbox,
         usage_notifier: UsageAlertNotifier | None = None,
+        token_store: TokenStore | None = None,
     ) -> None:
         self.settings = settings
         self.sandbox_cls = sandbox_cls
         self.usage_notifier = usage_notifier
+        self.token_store = token_store
 
     async def _run_claude(self, sandbox: Any, cmd: str, timeout: int) -> Any:
-        """Roda uma sessão do Claude e avisa quando o uso da sessão passa do limiar."""
+        """Roda uma sessão do Claude, avisa quando o uso da sessão passa do limiar e grava os tokens."""
         notifier = self.usage_notifier
-        if notifier is None:
-            return await _run_with_heartbeat(sandbox, cmd, timeout)
         info = activity.info()
-        watcher = UsageWatcher(f"{info.workflow_id}/{info.activity_type}")
+        watcher = UsageWatcher(f"{info.workflow_id}/{info.activity_type}") if notifier else None
+        meter = TokenMeter()
         tasks: set[asyncio.Task[bool]] = set()
 
         def on_line(chunk: str) -> None:
             # Exceção aqui faria o E2B parar de ler o stdout e falhar a sessão.
+            try:
+                meter.feed(chunk)
+            except Exception:
+                activity.logger.warning("falha ao contar os tokens da sessão", exc_info=True)
+            if watcher is None or notifier is None:
+                return
             try:
                 for alert in watcher.feed(chunk):
                     tasks.add(asyncio.create_task(notifier.notify(alert)))
@@ -308,6 +319,7 @@ class SandboxActivities:
         try:
             return await _run_with_heartbeat(sandbox, cmd, timeout, on_line=on_line)
         finally:
+            await self._record_session(meter, info)
             if tasks:
                 # O aviso nunca derruba a sessão: erros e demora ficam só no log.
                 done, pending = await asyncio.wait(tasks, timeout=NOTIFY_WAIT_S)
@@ -318,6 +330,28 @@ class SandboxActivities:
                         activity.logger.warning(
                             "aviso de uso falhou: %r", task.exception()
                         )
+
+    async def _record_session(self, meter: TokenMeter, info: Any) -> None:
+        """Grava o uso da sessão; nunca levanta (timeout e erro da sessão também gravam)."""
+        try:
+            stage = stage_for_workflow(info.workflow_id)
+            usage = meter.usage()
+            if self.token_store is None or stage is None or usage is None:
+                return
+            record = SessionRecord(
+                key=uuid.uuid4().hex,
+                issue_id=stage[1],
+                stage=stage[0],
+                workflow_id=info.workflow_id,
+                run_id=info.workflow_run_id,
+                activity=info.activity_type,
+                attempt=info.attempt,
+                recorded_at=datetime.now(UTC).isoformat(),
+                usage=usage,
+            )
+            await asyncio.to_thread(self.token_store.record, record)
+        except Exception:
+            activity.logger.warning("falha ao gravar o uso de tokens da sessão", exc_info=True)
 
     async def _connect(self, sandbox_id: str) -> Any:
         return await self.sandbox_cls.connect(sandbox_id, api_key=self.settings.e2b_api_key)
