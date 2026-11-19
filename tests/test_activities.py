@@ -578,6 +578,21 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "Implementado.")
         self.assertEqual(len(notifier.alerts), 1)
 
+    async def test_usage_watcher_error_does_not_fail_session(self) -> None:
+        notifier = FakeNotifier()
+        FakeSandbox.instance.commands.stdout = stream(
+            USAGE_EVENT, {"type": "result", "subtype": "success", "result": "Ok."}
+        )
+        with mock.patch(
+            "software_factory.orchestration.activities.UsageWatcher.feed",
+            side_effect=RecursionError("json aninhado"),
+        ):
+            result = await self.env.run(
+                self.with_notifier(notifier).implement_plan,
+                ImplementRequest(sandbox_id="sbx-1", issue=ISSUE),
+            )
+        self.assertEqual(result, "Ok.")
+
     async def test_run_tests_not_watched(self) -> None:
         notifier = FakeNotifier()
         FakeSandbox.instance.commands.stdout = stream(USAGE_EVENT)

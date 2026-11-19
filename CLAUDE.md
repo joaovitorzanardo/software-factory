@@ -42,7 +42,8 @@ Software factory experimental (fase de teste). O objetivo é automatizar o ciclo
   de app), opcional (sem `SMTP_HOST` fica desligado). Só com `CLAUDE_CODE_OAUTH_TOKEN`: toda sessão do
   Claude (menos `run_tests`) lê os `rate_limit_event` do stream-json e, com a janela `five_hour` em
   ≥ 80%, inicia o `UsageAlertWorkflow` com id `usage-alert-five-hour-<resetsAt>` e
-  `REJECT_DUPLICATE` (um email por janela, sem persistência). Erro no aviso nunca derruba a sessão.
+  `ALLOW_DUPLICATE_FAILED_ONLY` (um email por janela, sem persistência; um run que falhou deixa a
+  próxima travessia tentar de novo). Erro no aviso nunca derruba a sessão.
 
 Ainda **não definidos** (não assumir sem confirmar com o usuário): persistência e deploy. Ao introduzir qualquer tecnologia nova,
 pergunte antes e atualize esta seção.

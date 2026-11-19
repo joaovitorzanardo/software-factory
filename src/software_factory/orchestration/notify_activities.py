@@ -44,8 +44,9 @@ class UsageAlertNotifier:
                 alert,
                 id=workflow_id,
                 task_queue=self.task_queue,
-                # Rejeita também depois do run terminar: um email por janela.
-                id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
+                # Um email por janela: rejeita com run aberto ou concluído; depois de um run que
+                # falhou (SMTP fora), a próxima travessia tenta de novo.
+                id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE_FAILED_ONLY,
             )
         except WorkflowAlreadyStartedError:
             logger.info("aviso de uso %s já enviado ou em envio", workflow_id)

@@ -298,8 +298,12 @@ class SandboxActivities:
         tasks: set[asyncio.Task[bool]] = set()
 
         def on_line(chunk: str) -> None:
-            for alert in watcher.feed(chunk):
-                tasks.add(asyncio.create_task(notifier.notify(alert)))
+            # Exceção aqui faria o E2B parar de ler o stdout e falhar a sessão.
+            try:
+                for alert in watcher.feed(chunk):
+                    tasks.add(asyncio.create_task(notifier.notify(alert)))
+            except Exception:
+                activity.logger.warning("falha ao ler o uso da sessão", exc_info=True)
 
         try:
             return await _run_with_heartbeat(sandbox, cmd, timeout, on_line=on_line)

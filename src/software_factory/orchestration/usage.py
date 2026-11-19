@@ -1,6 +1,7 @@
 """Detecção do uso da sessão do Claude nos eventos `rate_limit_event` do stream-json."""
 
 import json
+import math
 from typing import Any
 
 from software_factory.orchestration.models import UsageAlert
@@ -11,7 +12,7 @@ SESSION_ALERT_THRESHOLD = 0.8
 
 
 def _number(value: Any) -> bool:
-    return isinstance(value, int | float) and not isinstance(value, bool)
+    return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
 
 
 def session_usage(event: dict[str, Any]) -> UsageAlert | None:

@@ -104,6 +104,12 @@ class TestEmailSettingsFromEnv(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 EmailSettings.from_env()
 
+    def test_rejects_unknown_timezone(self) -> None:
+        env = {**self.SMTP, "ALERT_TIMEZONE": "America/Sao Paulo"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(RuntimeError):
+                EmailSettings.from_env()
+
     def test_defaults(self) -> None:
         with mock.patch.dict(os.environ, self.SMTP, clear=True):
             settings = EmailSettings.from_env()

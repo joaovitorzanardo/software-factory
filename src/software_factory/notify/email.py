@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from email.message import EmailMessage
 from typing import Any
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from software_factory.orchestration.models import UsageAlert
 
@@ -40,6 +40,11 @@ class EmailSettings:
         if not host:
             return None
         username = _required("SMTP_USERNAME")
+        timezone = os.environ.get("ALERT_TIMEZONE") or DEFAULT_ALERT_TIMEZONE
+        try:
+            ZoneInfo(timezone)
+        except (ZoneInfoNotFoundError, ValueError):
+            raise RuntimeError(f"ALERT_TIMEZONE inválido: {timezone!r}") from None
         return cls(
             host=host,
             port=int(os.environ.get("SMTP_PORT") or DEFAULT_SMTP_PORT),
@@ -47,7 +52,7 @@ class EmailSettings:
             password=_required("SMTP_PASSWORD"),
             sender=os.environ.get("ALERT_EMAIL_FROM") or username,
             to=_required("ALERT_EMAIL_TO"),
-            timezone=os.environ.get("ALERT_TIMEZONE") or DEFAULT_ALERT_TIMEZONE,
+            timezone=timezone,
         )
 
 

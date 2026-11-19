@@ -50,6 +50,11 @@ class TestSessionUsage(unittest.TestCase):
         )
         self.assertIsNone(session_usage(weekly))
 
+    def test_ignores_non_finite_values(self) -> None:
+        self.assertIsNone(session_usage(rate_info(unifiedWindows=unified(float("nan")))))
+        infinite_reset = rate_info(unifiedWindows=unified(0.9, float("inf")))  # type: ignore[arg-type]
+        self.assertIsNone(session_usage(infinite_reset))
+
     def test_ignores_other_events(self) -> None:
         self.assertIsNone(session_usage({"type": "result", "subtype": "success"}))
         no_utilization = rate_info(rateLimitType="five_hour", resetsAt=RESET, status="allowed")

@@ -74,13 +74,13 @@ class FakeClient:
 
 
 class TestUsageAlertNotifier(unittest.IsolatedAsyncioTestCase):
-    async def test_notifier_starts_with_reject_duplicate(self) -> None:
+    async def test_notifier_dedups_unless_failed(self) -> None:
         client = FakeClient()
         self.assertTrue(await UsageAlertNotifier(client, "factory-queue").notify(ALERT))
         [(args, kwargs)] = client.calls
         self.assertEqual(args, (UsageAlertWorkflow.run, ALERT))
         self.assertEqual(kwargs["id"], "usage-alert-five-hour-1795440000")
-        self.assertEqual(kwargs["id_reuse_policy"], WorkflowIDReusePolicy.REJECT_DUPLICATE)
+        self.assertEqual(kwargs["id_reuse_policy"], WorkflowIDReusePolicy.ALLOW_DUPLICATE_FAILED_ONLY)
         self.assertEqual(kwargs["task_queue"], "factory-queue")
 
     async def test_notifier_duplicate(self) -> None:
