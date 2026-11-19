@@ -197,6 +197,28 @@ class TestFactorySettings(unittest.TestCase):
         with mock.patch.dict(os.environ, {**env, "TEST_COMMAND": "make test"}, clear=True):
             self.assertEqual(FactorySettings.from_env().test_command, "make test")
 
+    def test_alert_email_optional(self) -> None:
+        env = {
+            "E2B_API_KEY": "e2b-key",
+            "ANTHROPIC_API_KEY": "anthropic-key",
+            "GITHUB_TOKEN": "gh-token",
+            "TARGET_REPO": "acme/app",
+            "LINEAR_API_KEY": "lin-key",
+            "TEST_COMMAND": "make test",
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertIsNone(FactorySettings.from_env().alert_email)
+        smtp = {
+            "SMTP_HOST": "smtp.example.com",
+            "SMTP_USERNAME": "bot@example.com",
+            "SMTP_PASSWORD": "pw",
+            "ALERT_EMAIL_TO": "dev@example.com",
+        }
+        with mock.patch.dict(os.environ, {**env, **smtp}, clear=True):
+            alert_email = FactorySettings.from_env().alert_email
+            assert alert_email is not None
+            self.assertEqual(alert_email.host, "smtp.example.com")
+
 
 class TestBuildPlanPrompt(unittest.TestCase):
     def test_includes_issue_fields(self) -> None:

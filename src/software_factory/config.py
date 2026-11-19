@@ -1,6 +1,8 @@
 import os
 from dataclasses import dataclass, field
 
+from software_factory.notify.email import EmailSettings
+
 DEFAULT_TRIGGER_LABELS = frozenset({"feature", "bug"})
 DEFAULT_TEMPORAL_ADDRESS = "localhost:7233"
 DEFAULT_TASK_QUEUE = "software-factory"
@@ -50,6 +52,8 @@ class FactorySettings:
     temporal_address: str = DEFAULT_TEMPORAL_ADDRESS
     task_queue: str = DEFAULT_TASK_QUEUE
     e2b_template: str = "claude"
+    # SMTP do aviso de 80% da sessão do Claude; None = aviso desligado (sem SMTP_HOST).
+    alert_email: EmailSettings | None = None
 
     def __post_init__(self) -> None:
         if bool(self.anthropic_api_key) == bool(self.claude_code_oauth_token):
@@ -76,4 +80,5 @@ class FactorySettings:
             temporal_address=os.environ.get("TEMPORAL_ADDRESS", DEFAULT_TEMPORAL_ADDRESS),
             task_queue=os.environ.get("TASK_QUEUE", DEFAULT_TASK_QUEUE),
             e2b_template=os.environ.get("E2B_TEMPLATE", "claude"),
+            alert_email=EmailSettings.from_env(),
         )
