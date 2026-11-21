@@ -128,6 +128,7 @@ temporal operator namespace update --namespace default --retention 30d
 | `ALERT_EMAIL_FROM` | worker | remetente do aviso (default `SMTP_USERNAME`) |
 | `ALERT_EMAIL_TO` | worker | destinatário do aviso; obrigatória com `SMTP_HOST` |
 | `ALERT_TIMEZONE` | worker | fuso do horário do reset no email (default `America/Sao_Paulo`) |
+| `TOKEN_USAGE_DB` | worker | opcional: arquivo SQLite do uso de tokens (default `token_usage.db`); no WSL com o repo em `/mnt/c` ou OneDrive, prefira um caminho no lado Linux (ex.: `~/.local/share/software-factory/token_usage.db`): o lock do SQLite em drvfs não é confiável, a sincronização pode travar ou reverter o arquivo, e erro de escrita só vira warning no log |
 
 ### Aviso de uso da sessão do Claude
 
@@ -138,6 +139,31 @@ e o horário em que o limite reseta. Sai um email por janela, mesmo com várias 
 o `UsageAlertWorkflow` tem id `usage-alert-five-hour-<resetsAt>` e o Temporal recusa o segundo.
 Limitações: com `ANTHROPIC_API_KEY` não há sessão e o aviso não dispara; a saída de `TEST_COMMAND`
 não é monitorada; um retry do envio depois de um SMTP que deu certo pode duplicar o email.
+
+### Relatório de tokens
+
+Toda sessão do Claude (menos `run_tests`) grava no SQLite (`TOKEN_USAGE_DB`) os tokens de input,
+output, cache write e cache read, o custo estimado e o modelo. No fim do planejamento, da implementação
+e da review o worker cria ou edita **um comentário por issue** no Linear com os totais por etapa; no
+merge (issue em `Done`) o comentário ganha a linha `Total:`. Workflow que falha não publica, mas os
+registros entram no próximo comentário; falha ao publicar só gera um warning.
+
+Com `CLAUDE_CODE_OAUTH_TOKEN` o relatório também mostra a parcela da janela de 5 horas usada pela sessão
+(`max(last) - min(first)` por `resetsAt`). É uma estimativa: inclui outro uso da mesma conta no intervalo
+e tem granularidade de 1%. Sem o evento `result` do stream, os tokens vêm da soma das mensagens
+`assistant` (subconta output) e o registro aparece como `(parcial)`. O arquivo assume um único worker.
+
+```bash
+# tokens e custo por etapa, por issue
+sqlite3 token_usage.db "SELECT issue_id, stage, COUNT(*) sessoes,
+  SUM(input_tokens+output_tokens+cache_creation_tokens+cache_read_tokens) total,
+  SUM(cost_usd) custo FROM sessions GROUP BY issue_id, stage"
+# média de tokens por 1% da janela de 5h (com assinatura); aproximada: sessão que cruza duas janelas conta nos
+# dois grupos e sessões sem amostras da janela ficam de fora
+sqlite3 token_usage.db "SELECT AVG(t / (s*100)) FROM (SELECT SUM(input_tokens+output_tokens+cache_creation_tokens+cache_read_tokens) t,
+  MAX(w.util_last)-MIN(w.util_first) s FROM sessions JOIN session_windows w ON w.session_key = sessions.key
+  GROUP BY sessions.issue_id, sessions.stage, w.resets_at HAVING s > 0)"
+```
 
 ## Worker (Temporal + E2B)
 

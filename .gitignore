@@ -8,3 +8,4 @@ dist/
 .coverage
 .env
 temporal.db
+token_usage.db

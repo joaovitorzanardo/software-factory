@@ -18,6 +18,7 @@ with workflow.unsafe.imports_passed_through():
         PlanIssueInput,
         PullRequestRequest,
     )
+    from software_factory.orchestration.token_reporting import publish_token_usage
     from software_factory.orchestration.sessions import (  # noqa: F401 (reexportados)
         ANALYSIS_CAP,
         ANSWER_POLL_INTERVAL,
@@ -87,6 +88,7 @@ class ImplementIssueWorkflow(SessionWorkflow):
         tests = await self._implement_session(issue, attempt=0)
         green = await self._fix_until_green(issue, tests, STATE_IN_PROGRESS)
         if green is None:
+            await publish_token_usage(issue.issue_id)
             return ImplementResult(issue.identifier, OUTCOME_STOPPED)
 
 
@@ -98,5 +100,6 @@ class ImplementIssueWorkflow(SessionWorkflow):
             retry_policy=RetryPolicy(maximum_attempts=5),
             result_type=str,
         )
+        await publish_token_usage(issue.issue_id)
         await self._move(MoveIssueRequest(issue.issue_id, to_state=STATE_IN_REVIEW))
         return ImplementResult(issue.identifier, OUTCOME_PR_OPENED, pr_url)

@@ -128,9 +128,16 @@ class FixRequest:
 @dataclass(frozen=True)
 class CommentRequest:
     issue_id: str
-    # UUID v4 gerado no workflow: idempotência.
+    # UUID gerado pelo chamador: idempotência (post_comment cria uma vez; upsert_comment edita).
     comment_id: str
     body: str
+
+
+@dataclass(frozen=True)
+class UsageReportRequest:
+    issue_id: str
+    # Com final, o comentário inclui a linha de total.
+    final: bool = False
 
 
 @dataclass(frozen=True)

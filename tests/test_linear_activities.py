@@ -187,6 +187,67 @@ class TestPostComment(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(ctx.exception.non_retryable)
 
 
+class TestUpsertComment(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.requests: list[httpx.Request] = []
+        self.responses: list[dict[str, Any]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.requests.append(request)
+            return httpx.Response(200, json=self.responses.pop(0))
+
+        client = LinearClient("lin-key", transport=httpx.MockTransport(handler))
+        self.activities = LinearActivities(client)
+
+    async def run_upsert(self, request: CommentRequest, *responses: dict[str, Any]) -> str:
+        self.responses.extend(responses)
+        return await ActivityEnvironment().run(self.activities.upsert_comment, request)
+
+    def variables(self, index: int) -> dict[str, Any]:
+        return json.loads(self.requests[index].content)["variables"]
+
+    async def test_upsert_creates_when_missing(self) -> None:
+        result = await self.run_upsert(
+            CommentRequest("issue-1", "c-1", "Tokens"),
+            {"data": {"issue": {"comments": {"nodes": []}}}},
+            {"data": {"commentCreate": {"success": True, "comment": {"id": "c-1"}}}},
+        )
+        self.assertEqual(result, "c-1")
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(
+            self.variables(1),
+            {"input": {"id": "c-1", "issueId": "issue-1", "body": "Tokens"}},
+        )
+
+    async def test_upsert_updates_when_exists(self) -> None:
+        result = await self.run_upsert(
+            CommentRequest("issue-1", "c-1", "Novo corpo"),
+            {"data": {"issue": {"comments": {"nodes": [{"id": "c-1"}]}}}},
+            {"data": {"commentUpdate": {"success": True}}},
+        )
+        self.assertEqual(result, "c-1")
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(self.variables(1), {"id": "c-1", "body": "Novo corpo"})
+        self.assertIn("commentUpdate", json.loads(self.requests[1].content)["query"])
+
+    async def test_upsert_update_not_success_raises(self) -> None:
+        with self.assertRaises(ApplicationError) as ctx:
+            await self.run_upsert(
+                CommentRequest("issue-1", "c-1", "Tokens"),
+                {"data": {"issue": {"comments": {"nodes": [{"id": "c-1"}]}}}},
+                {"data": {"commentUpdate": {"success": False}}},
+            )
+        self.assertFalse(ctx.exception.non_retryable)
+
+    async def test_upsert_issue_not_found_non_retryable(self) -> None:
+        with self.assertRaises(ApplicationError) as ctx:
+            await self.run_upsert(
+                CommentRequest("issue-1", "c-1", "Tokens"), {"data": {"issue": None}}
+            )
+        self.assertTrue(ctx.exception.non_retryable)
+        self.assertEqual(len(self.requests), 1)
+
+
 class TestCreateIssue(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.requests: list[httpx.Request] = []
