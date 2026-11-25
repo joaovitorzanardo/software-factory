@@ -20,6 +20,7 @@ from software_factory.orchestration.usage import UsageWatcher
 from software_factory.orchestration.models import (
     AnalyzeRequest,
     CloneBranchRequest,
+    CloneRepoRequest,
     Clarification,
     CommitImplementationRequest,
     CommitPlanRequest,
@@ -28,6 +29,7 @@ from software_factory.orchestration.models import (
     ImplementRequest,
     PlanIssueInput,
     PlanRequest,
+    RunTestsRequest,
     TestRunResult,
 )
 
@@ -135,7 +137,7 @@ URL: {issue.url or "-"}
 
 _NO_TEST_TAMPERING = (
     "Proibido apagar, pular ou afrouxar testes (nada de `skip`, `xfail`, remover asserts) "
-    "e proibido mudar o `TEST_COMMAND`: a correção tem de estar no código, não nos testes."
+    "e proibido mudar o `.factory.toml`: a correção tem de estar no código, não nos testes."
 )
 
 
@@ -378,9 +380,9 @@ class SandboxActivities:
         return sandbox.sandbox_id
 
     @activity.defn
-    async def clone_repo(self, sandbox_id: str) -> None:
-        repo = self.settings.target_repo
-        sandbox = await self._connect(sandbox_id)
+    async def clone_repo(self, request: CloneRepoRequest) -> None:
+        repo = request.target.repo
+        sandbox = await self._connect(request.sandbox_id)
         if not await sandbox.files.exists(f"{REPO_DIR}/.git"):
             await sandbox.commands.run(
                 f"git clone --depth 1 {self._authed_url(repo)} {REPO_DIR}",
@@ -417,7 +419,7 @@ class SandboxActivities:
     async def commit_plan(self, request: CommitPlanRequest) -> str:
         path = plan_path(request.identifier)
         branch = plan_branch(request.identifier)
-        repo = self.settings.target_repo
+        repo = request.target.repo
         sandbox = await self._connect(request.sandbox_id)
         if not await sandbox.files.exists(f"{REPO_DIR}/{path}"):
             raise ApplicationError(f"plano não encontrado em {path}")
@@ -462,7 +464,7 @@ class SandboxActivities:
     async def clone_branch(self, request: CloneBranchRequest) -> str:
         """Clona factory/<ID> sem deixar o token no origin; retorna o SHA clonado."""
         branch = plan_branch(request.identifier)
-        repo = self.settings.target_repo
+        repo = request.target.repo
         sandbox = await self._connect(request.sandbox_id)
         if not await sandbox.files.exists(f"{REPO_DIR}/.git"):
             # Histórico recente para a análise ver o que mudou (sem token no origin, não dá
@@ -489,7 +491,7 @@ class SandboxActivities:
         sandbox = await self._connect(request.sandbox_id)
         await sandbox.files.write(
             IMPLEMENT_PROMPT_PATH,
-            build_implement_prompt(request.issue, self.settings.test_command),
+            build_implement_prompt(request.issue, request.target.test_command),
         )
         result = await self._run_claude(
             sandbox, implement_command(), IMPLEMENT_COMMAND_TIMEOUT_S
@@ -506,7 +508,7 @@ class SandboxActivities:
             f"rm -rf {FIX_DIR} && mkdir -p {FIX_DIR}", timeout=GIT_COMMAND_TIMEOUT_S
         )
         await sandbox.files.write(
-            ANALYZE_PROMPT_PATH, build_analyze_prompt(request, self.settings.test_command)
+            ANALYZE_PROMPT_PATH, build_analyze_prompt(request, request.target.test_command)
         )
         result = await self._run_claude(sandbox, analyze_command(), ANALYZE_COMMAND_TIMEOUT_S)
         parse_result(result.stdout)
@@ -535,18 +537,18 @@ class SandboxActivities:
         await sandbox.files.write(ANALYSIS_PATH, request.analysis)
         await sandbox.files.write(FIX_PLAN_PATH, request.plan)
         await sandbox.files.write(
-            FIX_PROMPT_PATH, build_fix_prompt(request, self.settings.test_command)
+            FIX_PROMPT_PATH, build_fix_prompt(request, request.target.test_command)
         )
         result = await self._run_claude(sandbox, fix_command(), IMPLEMENT_COMMAND_TIMEOUT_S)
         return parse_result(result.stdout)
 
     @activity.defn
-    async def run_tests(self, sandbox_id: str) -> TestRunResult:
-        """Roda TEST_COMMAND no repo; o orquestrador não confia no relato do Claude."""
-        sandbox = await self._connect(sandbox_id)
+    async def run_tests(self, request: RunTestsRequest) -> TestRunResult:
+        """Roda o comando de testes do repo; o orquestrador não confia no relato do Claude."""
+        sandbox = await self._connect(request.sandbox_id)
         try:
             result = await _run_with_heartbeat(
-                sandbox, self.settings.test_command, TEST_COMMAND_TIMEOUT_S
+                sandbox, request.target.test_command, TEST_COMMAND_TIMEOUT_S
             )
         except CommandExitException as error:
             output = (error.stdout or "") + (error.stderr or "")
@@ -556,7 +558,8 @@ class SandboxActivities:
             return TestRunResult(
                 passed=False,
                 output=(
-                    f"TEST_COMMAND estourou o timeout de {TEST_COMMAND_TIMEOUT_S // 60} min"
+                    "o comando de testes estourou o timeout de"
+                    f" {TEST_COMMAND_TIMEOUT_S // 60} min"
                     f" ({error}); algum teste travou ou ficou lento demais."
                 ),
             )
@@ -567,7 +570,7 @@ class SandboxActivities:
     async def commit_implementation(self, request: CommitImplementationRequest) -> str:
         branch = plan_branch(request.identifier)
         sandbox = await self._connect(request.sandbox_id)
-        repo = self.settings.target_repo
+        repo = request.target.repo
         token_env = await self._token_env(repo)
         url = self._authed_url(repo)
 

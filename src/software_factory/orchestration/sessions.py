@@ -21,6 +21,8 @@ with workflow.unsafe.imports_passed_through():
         ImplementRequest,
         MoveIssueRequest,
         PlanIssueInput,
+        RepoTarget,
+        RunTestsRequest,
         TestRunResult,
     )
 
@@ -79,6 +81,14 @@ class SessionWorkflow:
         self._clarifications: list[Clarification] = []
         self._pending_question: str | None = None
         self._answer: str | None = None
+        # Preenchido pelo `run` da subclasse (resolve_target) antes de qualquer sessão.
+        self._target: RepoTarget | None = None
+
+    @property
+    def target(self) -> RepoTarget:
+        if self._target is None:
+            raise ApplicationError("repo alvo não resolvido", non_retryable=True)
+        return self._target
 
     def _receive_answer(self, answer: HumanAnswer) -> None:
         # Só vale reply à pergunta pendente, e só o primeiro.
@@ -115,10 +125,23 @@ class SessionWorkflow:
     async def _clone_branch(self, sandbox_id: str, issue: PlanIssueInput) -> str:
         return await workflow.execute_activity(
             "clone_branch",
-            CloneBranchRequest(sandbox_id=sandbox_id, identifier=issue.identifier),
+            CloneBranchRequest(
+                sandbox_id=sandbox_id, identifier=issue.identifier, target=self.target
+            ),
             start_to_close_timeout=timedelta(minutes=5),
             retry_policy=RetryPolicy(maximum_attempts=3),
             result_type=str,
+        )
+
+    async def _run_tests(self, sandbox_id: str) -> TestRunResult:
+        # Uma tentativa só: timeout já vira vermelho dentro da activity.
+        return await workflow.execute_activity(
+            "run_tests",
+            RunTestsRequest(sandbox_id=sandbox_id, target=self.target),
+            start_to_close_timeout=timedelta(minutes=12),
+            heartbeat_timeout=timedelta(minutes=2),
+            retry_policy=RetryPolicy(maximum_attempts=1),
+            result_type=TestRunResult,
         )
 
     async def _kill_sandbox(self, sandbox_id: str) -> None:
@@ -143,6 +166,7 @@ class SessionWorkflow:
                 sandbox_id=sandbox_id,
                 identifier=issue.identifier,
                 base_sha=base_sha,
+                target=self.target,
                 message=message,
                 require_changes=require_changes,
             ),
@@ -166,7 +190,7 @@ class SessionWorkflow:
             if fix is None:
                 await workflow.execute_activity(
                     "implement_plan",
-                    ImplementRequest(sandbox_id=sandbox_id, issue=issue),
+                    ImplementRequest(sandbox_id=sandbox_id, issue=issue, target=self.target),
                     start_to_close_timeout=timedelta(minutes=35),
                     heartbeat_timeout=timedelta(minutes=2),
                     retry_policy=RetryPolicy(maximum_attempts=1),
@@ -181,6 +205,7 @@ class SessionWorkflow:
                             issue=issue,
                             analysis=fix.analysis,
                             plan=fix.plan or "",
+                            target=self.target,
                             clarifications=tuple(self._clarifications),
                         ),
                         start_to_close_timeout=timedelta(minutes=35),
@@ -208,14 +233,7 @@ class SessionWorkflow:
                             failure_message(commit_error),
                         )
                     return failed
-            tests: TestRunResult = await workflow.execute_activity(
-                "run_tests",
-                sandbox_id,
-                start_to_close_timeout=timedelta(minutes=12),
-                heartbeat_timeout=timedelta(minutes=2),
-                retry_policy=RetryPolicy(maximum_attempts=1),
-                result_type=TestRunResult,
-            )
+            tests = await self._run_tests(sandbox_id)
             if tests.passed:
                 message = f"feat: implementa {issue.identifier}"
             else:
@@ -248,6 +266,7 @@ class SessionWorkflow:
                         sandbox_id=sandbox_id,
                         issue=issue,
                         test_output=test_output,
+                        target=self.target,
                         attempts=tuple(attempts),
                         clarifications=tuple(self._clarifications),
                     ),

@@ -33,6 +33,7 @@ from software_factory.orchestration.token_store import TokenStore
 from software_factory.orchestration.models import (
     AnalyzeRequest,
     CloneBranchRequest,
+    CloneRepoRequest,
     Clarification,
     CommitImplementationRequest,
     CommitPlanRequest,
@@ -42,6 +43,8 @@ from software_factory.orchestration.models import (
     ImplementRequest,
     PlanIssueInput,
     PlanRequest,
+    RepoTarget,
+    RunTestsRequest,
     TestRunResult,
     UsageAlert,
 )
@@ -52,10 +55,9 @@ SETTINGS = FactorySettings(
     e2b_api_key="e2b-key",
     anthropic_api_key="anthropic-key",
     github_token="gh-token",
-    target_repo="acme/app",
     linear_api_key="lin-key",
-    test_command="python -m pytest",
 )
+TARGET = RepoTarget("acme/app", "python -m pytest")
 
 ISSUE = PlanIssueInput(
     issue_id="issue-1",
@@ -206,8 +208,6 @@ class TestFactorySettings(unittest.TestCase):
             "E2B_API_KEY": "e2b-key",
             "ANTHROPIC_API_KEY": "anthropic-key",
             "GITHUB_TOKEN": "gh-token",
-            "TARGET_REPO": "acme/app",
-            "TEST_COMMAND": "make test",
         }
         with mock.patch.dict(os.environ, env, clear=True):
             with self.assertRaises(RuntimeError):
@@ -215,28 +215,24 @@ class TestFactorySettings(unittest.TestCase):
         with mock.patch.dict(os.environ, {**env, "LINEAR_API_KEY": "lin-key"}, clear=True):
             self.assertEqual(FactorySettings.from_env().linear_api_key, "lin-key")
 
-    def test_from_env_requires_test_command(self) -> None:
+    def test_from_env_without_target_repo_and_test_command(self) -> None:
         env = {
             "E2B_API_KEY": "e2b-key",
             "ANTHROPIC_API_KEY": "anthropic-key",
             "GITHUB_TOKEN": "gh-token",
-            "TARGET_REPO": "acme/app",
             "LINEAR_API_KEY": "lin-key",
         }
         with mock.patch.dict(os.environ, env, clear=True):
-            with self.assertRaises(RuntimeError):
-                FactorySettings.from_env()
-        with mock.patch.dict(os.environ, {**env, "TEST_COMMAND": "make test"}, clear=True):
-            self.assertEqual(FactorySettings.from_env().test_command, "make test")
+            settings = FactorySettings.from_env()
+        self.assertFalse(hasattr(settings, "target_repo"))
+        self.assertFalse(hasattr(settings, "test_command"))
 
     def test_token_usage_db_default_and_env(self) -> None:
         env = {
             "E2B_API_KEY": "e2b-key",
             "ANTHROPIC_API_KEY": "anthropic-key",
             "GITHUB_TOKEN": "gh-token",
-            "TARGET_REPO": "acme/app",
             "LINEAR_API_KEY": "lin-key",
-            "TEST_COMMAND": "make test",
         }
         with mock.patch.dict(os.environ, env, clear=True):
             self.assertEqual(FactorySettings.from_env().token_usage_db, "token_usage.db")
@@ -248,9 +244,7 @@ class TestFactorySettings(unittest.TestCase):
             "E2B_API_KEY": "e2b-key",
             "ANTHROPIC_API_KEY": "anthropic-key",
             "GITHUB_TOKEN": "gh-token",
-            "TARGET_REPO": "acme/app",
             "LINEAR_API_KEY": "lin-key",
-            "TEST_COMMAND": "make test",
         }
         with mock.patch.dict(os.environ, env, clear=True):
             self.assertIsNone(FactorySettings.from_env().alert_email)
@@ -302,7 +296,7 @@ class TestBuildImplementPrompt(unittest.TestCase):
 class TestFixPrompts(unittest.TestCase):
     def test_analyze_prompt(self) -> None:
         request = AnalyzeRequest(
-            "sbx-1", ISSUE, test_output="FAILED test_login",
+            "sbx-1", ISSUE, test_output="FAILED test_login", target=TARGET,
             attempts=(FixAttempt(1, "faltava hash", "FAILED test_hash"),),
             clarifications=(Clarification("Usar bcrypt?", "Sim"),),
         )
@@ -314,17 +308,25 @@ class TestFixPrompts(unittest.TestCase):
         self.assertIn("apagar, pular ou afrouxar testes", prompt)
 
     def test_analyze_prompt_omits_empty_sections(self) -> None:
-        prompt = build_analyze_prompt(AnalyzeRequest("sbx-1", ISSUE, "FAILED"), "make test")
+        prompt = build_analyze_prompt(AnalyzeRequest("sbx-1", ISSUE, "FAILED", TARGET), "make test")
         self.assertNotIn("Tentativas anteriores", prompt)
         self.assertNotIn("Decisões da pessoa", prompt)
 
     def test_fix_prompt(self) -> None:
         prompt = build_fix_prompt(
-            FixRequest("sbx-1", ISSUE, "análise", "plano",
+            FixRequest("sbx-1", ISSUE, "análise", "plano", TARGET,
                        (Clarification("Usar bcrypt?", "Sim"),)), "python -m pytest")
         for text in (FIX_PLAN_PATH, ANALYSIS_PATH, "python -m pytest", "git push",
                      "Usar bcrypt?", "apagar, pular ou afrouxar testes"):
             self.assertIn(text, prompt)
+
+
+    def test_fix_prompt_forbids_changing_factory_toml(self) -> None:
+        prompt = build_fix_prompt(
+            FixRequest("sbx-1", ISSUE, "análise", "plano", TARGET), "python -m pytest"
+        )
+        self.assertIn("`.factory.toml`", prompt)
+        self.assertNotIn("TEST_COMMAND", prompt)
 
 
 class TestPlanPath(unittest.TestCase):
@@ -385,7 +387,7 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call["envs"], {"CLAUDE_CODE_OAUTH_TOKEN": "oat-token"})
 
     async def test_clone_repo(self) -> None:
-        await self.env.run(self.activities.clone_repo, "sbx-1")
+        await self.env.run(self.activities.clone_repo, CloneRepoRequest("sbx-1", TARGET))
         run = FakeSandbox.instance.commands.runs[0]
         self.assertIn("git clone --depth 1", run["cmd"])
         self.assertIn("github.com/acme/app.git", run["cmd"])
@@ -393,7 +395,7 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(run["envs"], {"GITHUB_TOKEN": "gh-token"})
 
     async def test_clone_repo_leaves_no_token_in_origin(self) -> None:
-        await self.env.run(self.activities.clone_repo, "sbx-1")
+        await self.env.run(self.activities.clone_repo, CloneRepoRequest("sbx-1", TARGET))
         runs = FakeSandbox.instance.commands.runs
         self.assertEqual(runs[0]["envs"], {"GITHUB_TOKEN": "gh-token"})
         self.assertIn(
@@ -404,7 +406,7 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
 
     async def test_clone_repo_skips_existing(self) -> None:
         FakeSandbox.instance.files.existing.add(f"{REPO_DIR}/.git")
-        await self.env.run(self.activities.clone_repo, "sbx-1")
+        await self.env.run(self.activities.clone_repo, CloneRepoRequest("sbx-1", TARGET))
         cmds = [r["cmd"] for r in FakeSandbox.instance.commands.runs]
         self.assertEqual(cmds, ["git remote set-url origin https://github.com/acme/app.git"])
 
@@ -479,7 +481,7 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
         FakeSandbox.instance.files.existing.add(PLAN_FILE)
         FakeSandbox.instance.commands.responses = {"rev-parse": "abc123\n", "ls-remote": remote}
         return await self.env.run(
-            self.activities.commit_plan, CommitPlanRequest(sandbox_id="sbx-1", identifier="ENG-12")
+            self.activities.commit_plan, CommitPlanRequest("sbx-1", "ENG-12", TARGET)
         )
 
     def commands(self) -> list[str]:
@@ -515,11 +517,11 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
             return f"tok-{calls}"
 
         activities = SandboxActivities(SETTINGS, tokens, sandbox_cls=FakeSandbox)
-        await self.env.run(activities.clone_repo, "sbx-1")
+        await self.env.run(activities.clone_repo, CloneRepoRequest("sbx-1", TARGET))
         FakeSandbox.instance.files.existing.add(PLAN_FILE)
         FakeSandbox.instance.commands.responses = {"rev-parse": "abc123\n", "ls-remote": ""}
         await self.env.run(
-            activities.commit_plan, CommitPlanRequest(sandbox_id="sbx-1", identifier="ENG-12")
+            activities.commit_plan, CommitPlanRequest("sbx-1", "ENG-12", TARGET)
         )
         runs = FakeSandbox.instance.commands.runs
         push = next(r for r in runs if " push " in r["cmd"])
@@ -546,14 +548,14 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ApplicationError):
             await self.env.run(
                 self.activities.commit_plan,
-                CommitPlanRequest(sandbox_id="sbx-1", identifier="ENG-12"),
+                CommitPlanRequest(sandbox_id="sbx-1", identifier="ENG-12", target=TARGET),
             )
         self.assertEqual(self.commands(), [])
 
     async def test_clone_branch(self) -> None:
         FakeSandbox.instance.commands.responses = {"rev-parse": "abc123\n"}
         sha = await self.env.run(
-            self.activities.clone_branch, CloneBranchRequest(sandbox_id="sbx-1", identifier="ENG-12")
+            self.activities.clone_branch, CloneBranchRequest("sbx-1", "ENG-12", TARGET)
         )
         self.assertEqual(sha, "abc123")
         runs = FakeSandbox.instance.commands.runs
@@ -574,11 +576,22 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
         for run in runs[1:]:
             self.assertEqual(run["cwd"], REPO_DIR)
 
+    async def test_clone_branch_uses_target_repo(self) -> None:
+        FakeSandbox.instance.commands.responses = {"rev-parse": "abc123\n"}
+        await self.env.run(
+            self.activities.clone_branch,
+            CloneBranchRequest("sbx-1", "ENG-12", RepoTarget("acme/api", "npm test")),
+        )
+        runs = FakeSandbox.instance.commands.runs
+        self.assertIn("x-access-token:$GITHUB_TOKEN@github.com/acme/api.git", runs[0]["cmd"])
+        self.assertIn("git remote set-url origin https://github.com/acme/api.git", self.commands())
+        self.assertFalse(any("acme/app" in cmd for cmd in self.commands()))
+
     async def test_clone_branch_retry_skips_clone_but_resets_origin(self) -> None:
         FakeSandbox.instance.files.existing.add(f"{REPO_DIR}/.git")
         FakeSandbox.instance.commands.responses = {"rev-parse": "abc123\n"}
         await self.env.run(
-            self.activities.clone_branch, CloneBranchRequest(sandbox_id="sbx-1", identifier="ENG-12")
+            self.activities.clone_branch, CloneBranchRequest("sbx-1", "ENG-12", TARGET)
         )
         commands = self.commands()
         self.assertFalse(any("git clone" in cmd for cmd in commands))
@@ -591,7 +604,7 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
             {"type": "result", "subtype": "success", "result": "Implementado."},
         )
         result = await self.env.run(
-            self.activities.implement_plan, ImplementRequest(sandbox_id="sbx-1", issue=ISSUE)
+            self.activities.implement_plan, ImplementRequest("sbx-1", ISSUE, TARGET)
         )
         self.assertEqual(result, "Implementado.")
         self.assertIn("ENG-12", FakeSandbox.instance.files.written["/home/user/implement-prompt.md"])
@@ -608,7 +621,7 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaises(ApplicationError):
             await self.env.run(
-                self.activities.implement_plan, ImplementRequest(sandbox_id="sbx-1", issue=ISSUE)
+                self.activities.implement_plan, ImplementRequest("sbx-1", ISSUE, TARGET)
             )
 
     def with_notifier(self, notifier: FakeNotifier) -> SandboxActivities:
@@ -621,7 +634,7 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
         )
         result = await self.env.run(
             self.with_notifier(notifier).implement_plan,
-            ImplementRequest(sandbox_id="sbx-1", issue=ISSUE),
+            ImplementRequest("sbx-1", ISSUE, TARGET),
         )
         self.assertEqual(result, "Implementado.")
         source = f"{self.env.info.workflow_id}/{self.env.info.activity_type}"
@@ -634,7 +647,7 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
         )
         result = await self.env.run(
             self.with_notifier(notifier).implement_plan,
-            ImplementRequest(sandbox_id="sbx-1", issue=ISSUE),
+            ImplementRequest("sbx-1", ISSUE, TARGET),
         )
         self.assertEqual(result, "Implementado.")
         self.assertEqual(len(notifier.alerts), 1)
@@ -650,7 +663,7 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
         ):
             result = await self.env.run(
                 self.with_notifier(notifier).implement_plan,
-                ImplementRequest(sandbox_id="sbx-1", issue=ISSUE),
+                ImplementRequest("sbx-1", ISSUE, TARGET),
             )
         self.assertEqual(result, "Ok.")
 
@@ -676,7 +689,7 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
         )
         activities, env = self.with_store(store)
         await env.run(
-            activities.implement_plan, ImplementRequest(sandbox_id="sbx-1", issue=ISSUE)
+            activities.implement_plan, ImplementRequest("sbx-1", ISSUE, TARGET)
         )
         usage = store.issue_usage("abc")
         self.assertEqual(usage.stages["implement"].tokens, TokenCounts(4, 175, 40261, 37118))
@@ -693,7 +706,7 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
         activities, env = self.with_store(store)
         with self.assertRaises(TimeoutException):
             await env.run(
-                activities.implement_plan, ImplementRequest(sandbox_id="sbx-1", issue=ISSUE)
+                activities.implement_plan, ImplementRequest("sbx-1", ISSUE, TARGET)
             )
         self.assertTrue(store.issue_usage("abc").stages["implement"].partial)
 
@@ -705,7 +718,7 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
         activities, env = self.with_store(store)
         with mock.patch.object(store, "record", side_effect=sqlite3.OperationalError("locked")):
             result = await env.run(
-                activities.implement_plan, ImplementRequest(sandbox_id="sbx-1", issue=ISSUE)
+                activities.implement_plan, ImplementRequest("sbx-1", ISSUE, TARGET)
             )
         self.assertEqual(result, "Ok.")
 
@@ -717,7 +730,7 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
         activities, env = self.with_store(store, workflow_id="outro-x")
         with mock.patch.object(store, "record") as record:
             result = await env.run(
-                activities.implement_plan, ImplementRequest(sandbox_id="sbx-1", issue=ISSUE)
+                activities.implement_plan, ImplementRequest("sbx-1", ISSUE, TARGET)
             )
         self.assertEqual(result, "Ok.")
         record.assert_not_called()
@@ -730,7 +743,7 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
         )
         activities, env = self.with_store(store, usage_notifier=notifier)
         await env.run(
-            activities.implement_plan, ImplementRequest(sandbox_id="sbx-1", issue=ISSUE)
+            activities.implement_plan, ImplementRequest("sbx-1", ISSUE, TARGET)
         )
         self.assertEqual(len(notifier.alerts), 1)
         self.assertEqual(store.issue_usage("abc").stages["implement"].tokens, TokenCounts())
@@ -738,7 +751,9 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
     async def test_run_tests_not_watched(self) -> None:
         notifier = FakeNotifier()
         FakeSandbox.instance.commands.stdout = stream(USAGE_EVENT)
-        result = await self.env.run(self.with_notifier(notifier).run_tests, "sbx-1")
+        result = await self.env.run(
+            self.with_notifier(notifier).run_tests, RunTestsRequest("sbx-1", TARGET)
+        )
         self.assertTrue(result.passed)
         self.assertEqual(notifier.alerts, [])
 
@@ -747,21 +762,40 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
             USAGE_EVENT, {"type": "result", "subtype": "success", "result": "Implementado."}
         )
         result = await self.env.run(
-            self.activities.implement_plan, ImplementRequest(sandbox_id="sbx-1", issue=ISSUE)
+            self.activities.implement_plan, ImplementRequest("sbx-1", ISSUE, TARGET)
         )
         self.assertEqual(result, "Implementado.")
 
     async def test_run_tests_green(self) -> None:
         FakeSandbox.instance.commands.stdout = "5 passed"
-        result = await self.env.run(self.activities.run_tests, "sbx-1")
+        result = await self.env.run(self.activities.run_tests, RunTestsRequest("sbx-1", TARGET))
         self.assertEqual(result, TestRunResult(True, "5 passed"))
         (run,) = FakeSandbox.instance.commands.runs
         self.assertEqual(run["cmd"], "python -m pytest")
         self.assertEqual(run["cwd"], REPO_DIR)
 
+    async def test_run_tests_uses_target_command(self) -> None:
+        await self.env.run(
+            self.activities.run_tests, RunTestsRequest("sbx-1", RepoTarget("acme/app", "npm test"))
+        )
+        runs = FakeSandbox.instance.commands.runs
+        self.assertEqual(runs[-1]["cmd"], "npm test")
+
+    async def test_implement_prompt_uses_target_command(self) -> None:
+        FakeSandbox.instance.commands.stdout = stream(
+            {"type": "result", "subtype": "success", "result": "Implementado."}
+        )
+        await self.env.run(
+            self.activities.implement_plan,
+            ImplementRequest("sbx-1", ISSUE, RepoTarget("acme/app", "npm test")),
+        )
+        prompt = FakeSandbox.instance.files.written["/home/user/implement-prompt.md"]
+        self.assertIn("`npm test`", prompt)
+        self.assertNotIn("python -m pytest", prompt)
+
     async def test_run_tests_red(self) -> None:
         FakeSandbox.instance.commands.fail = {"pytest": ("x" * 5000, "FAILED test_a", 1)}
-        result = await self.env.run(self.activities.run_tests, "sbx-1")
+        result = await self.env.run(self.activities.run_tests, RunTestsRequest("sbx-1", TARGET))
         self.assertFalse(result.passed)
         self.assertEqual(len(result.output), 4000)
         self.assertTrue(result.output.endswith("FAILED test_a"))
@@ -771,16 +805,17 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
             raise TimeoutException("context deadline exceeded")
 
         FakeSandbox.instance.commands.on_run = time_out
-        result = await self.env.run(self.activities.run_tests, "sbx-1")
+        result = await self.env.run(self.activities.run_tests, RunTestsRequest("sbx-1", TARGET))
         self.assertFalse(result.passed)
-        self.assertIn("TEST_COMMAND estourou o timeout de 10 min", result.output)
+        self.assertIn("o comando de testes estourou o timeout de 10 min", result.output)
 
     async def run_commit_implementation(self, head: str, remote: str, **kwargs: Any) -> str:
         FakeSandbox.instance.commands.responses = {"rev-parse": head, "ls-remote": remote}
         return await self.env.run(
             self.activities.commit_implementation,
             CommitImplementationRequest(
-                sandbox_id="sbx-1", identifier="ENG-12", base_sha="abc123", **kwargs
+                sandbox_id="sbx-1", identifier="ENG-12", base_sha="abc123", target=TARGET,
+                **kwargs,
             ),
         )
 
@@ -861,7 +896,7 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
     async def test_analyze_failure_returns_plan(self) -> None:
         self.claude_writes({ANALYSIS_PATH: "causa", FIX_PLAN_PATH: "plano"})
         result = await self.env.run(
-            self.activities.analyze_failure, AnalyzeRequest("sbx-1", ISSUE, "FAILED")
+            self.activities.analyze_failure, AnalyzeRequest("sbx-1", ISSUE, "FAILED", TARGET)
         )
         self.assertEqual(result, FixAnalysis(analysis="causa", plan="plano"))
         files = FakeSandbox.instance.files.written
@@ -874,7 +909,7 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
     async def test_analyze_failure_returns_question(self) -> None:
         self.claude_writes({ANALYSIS_PATH: "causa", QUESTION_PATH: "Trocar o ORM?"})
         result = await self.env.run(
-            self.activities.analyze_failure, AnalyzeRequest("sbx-1", ISSUE, "FAILED")
+            self.activities.analyze_failure, AnalyzeRequest("sbx-1", ISSUE, "FAILED", TARGET)
         )
         self.assertEqual(result, FixAnalysis(analysis="causa", question="Trocar o ORM?"))
 
@@ -882,13 +917,13 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
         self.claude_writes({ANALYSIS_PATH: "causa"})
         with self.assertRaises(ApplicationError):
             await self.env.run(
-                self.activities.analyze_failure, AnalyzeRequest("sbx-1", ISSUE, "FAILED")
+                self.activities.analyze_failure, AnalyzeRequest("sbx-1", ISSUE, "FAILED", TARGET)
             )
 
     async def test_implement_fix_writes_plan_and_runs_claude(self) -> None:
         self.claude_writes({})
         result = await self.env.run(
-            self.activities.implement_fix, FixRequest("sbx-1", ISSUE, "causa", "plano")
+            self.activities.implement_fix, FixRequest("sbx-1", ISSUE, "causa", "plano", TARGET)
         )
         files = FakeSandbox.instance.files.written
         self.assertEqual(files[FIX_PLAN_PATH], "plano")

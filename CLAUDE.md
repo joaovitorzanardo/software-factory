@@ -24,12 +24,16 @@ Software factory experimental (fase de teste). O objetivo é automatizar o ciclo
   (`claude -p --output-format stream-json --verbose`). Auth: exatamente uma de
   `ANTHROPIC_API_KEY` (API) ou `CLAUDE_CODE_OAUTH_TOKEN` (assinatura, `claude setup-token`;
   zona cinzenta nos termos para automação em sandbox de terceiro).
-- **Git/PR:** GitHub; um único repo alvo (`TARGET_REPO=owner/repo`), clonado no sandbox com
-  `GITHUB_TOKEN` fine-grained restrito a esse repo, com **Contents: Read and write** (push da
-  branch) e **Pull requests: Read and write** (abertura da PR). API REST do GitHub
-  (`https://api.github.com`) chamada com `httpx` puro (`github/client.py`, sem SDK).
-- **Testes do repo alvo:** `TEST_COMMAND` (env obrigatória do worker), rodado pelo orquestrador
-  no sandbox depois da implementação; exit 0 = verde. A PR só abre com verde.
+- **Git/PR:** GitHub; o repo alvo é **resolvido por issue** (activity `resolve_repo`, ver "Repo de
+  cada issue"), clonado no sandbox com `GITHUB_TOKEN` fine-grained com acesso aos repos dos
+  projetos, com **Contents: Read and write** (push da branch) e **Pull requests: Read and write**
+  (abertura da PR). As activities pedem o token a um `TokenProvider` (repo → token; hoje
+  `static_token(GITHUB_TOKEN)`) e a API a um `GitHubClients` (repo → `GitHubClient`,
+  `github_clients`). API REST do GitHub (`https://api.github.com`) chamada com `httpx` puro
+  (`github/client.py`, sem SDK).
+- **Testes do repo alvo:** `test_command` do `.factory.toml` na raiz do repo alvo (lido da branch
+  default), rodado pelo orquestrador no sandbox depois da implementação; exit 0 = verde. A PR só
+  abre com verde.
 - **Linear API:** só GraphQL (`https://api.linear.app/graphql`, não há REST), chamada com `httpx`
   puro (`linear/client.py`, sem SDK); personal API key em `LINEAR_API_KEY` (worker), com escrita em issues.
 - **Review:** skills `requesting-code-review` (lente `correctness`) e `receiving-code-review` (triagem) do
@@ -68,13 +72,15 @@ src/software_factory/
   notify/
     email.py          # EmailSettings (SMTP_*, ALERT_EMAIL_*, ALERT_TIMEZONE), build_usage_alert_email, send_email
   github/
-    client.py         # GitHubClient: REST com httpx (default_branch, get_file, find_open_pull, create_pull)
+    client.py         # GitHubClient: REST com httpx (default_branch, get_file, find_open_pull, create_pull);
+                      # TokenProvider/static_token e GitHubClients/github_clients (um client por repo)
   orchestration/
     models.py         # dataclasses de entrada/saída (PlanIssueInput, PlanRequest, CommitPlanRequest,
                       # MoveIssueRequest, PlanResult, CloneBranchRequest, ImplementRequest, TestRunResult,
                       # CommitImplementationRequest, PullRequestRequest, ImplementResult e, do loop de correção,
                       # FixAttempt, Clarification, AnalyzeRequest, FixAnalysis, FixRequest, CommentRequest,
-                      # HumanAnswer, UsageAlert, UsageReportRequest), STATE_* e OUTCOME_*
+                      # HumanAnswer, UsageAlert, UsageReportRequest, do repo por issue RepoTarget,
+                      # RepoResolution, CloneRepoRequest, RunTestsRequest, BranchRequest), STATE_* e OUTCOME_*
     activities.py     # SandboxActivities: create_sandbox, clone_repo, generate_plan, commit_plan,
                       # clone_branch, implement_plan, analyze_failure, implement_fix, run_tests,
                       # commit_implementation, kill_sandbox; install_skills (copia orchestration/skills/);
@@ -93,12 +99,17 @@ src/software_factory/
     review_activities.py  # ReviewActivities(sandbox): review_pull (duas lentes + triagem), implement_review_fix
     review_prompts.py     # prompts da review, parse_review, REVIEW_DIR, FINDING_DETAIL_CAP,
                           # SENSITIVE_PATTERNS e sensitive_files
-    sessions.py       # SessionWorkflow: base compartilhada (sessões, perguntas, espera de resposta) do implement e do review
+    sessions.py       # SessionWorkflow: base compartilhada (sessões, perguntas, espera de resposta) do implement e do review;
+                      # `_target` (RepoTarget) preenchido pelo `run` antes de qualquer sessão
+    repos.py          # regras puras: repo_from_url, linked_repos, pinned_repos, pin_url, parse_factory_config
+    repo_activities.py    # RepoActivities(linear, clients).resolve_repo: pin > link do projeto, + .factory.toml
+    repo_resolution.py    # resolve_target (helper dos workflows: resolve_repo; problema → post_comment e falha) e
+                          # repo_problem_comment
     github_activities.py  # GitHubActivities: plan_exists, pull_request_info, open_pull_request, merge_pull_request
-    workflow.py       # PlanIssueWorkflow: In Planning → sandbox → clone → plano → commit → kill (finally) → In Progress
-    implement_workflow.py # ImplementIssueWorkflow: plano existe? → sandbox → clone da branch → implementa →
+    workflow.py       # PlanIssueWorkflow: resolve o repo → In Planning → sandbox → clone → plano → commit → kill (finally) → In Progress
+    implement_workflow.py # ImplementIssueWorkflow: resolve o repo → plano existe? → sandbox → clone da branch → implementa →
                       # testes → (verde: push → PR → In Review; vermelho: loop analisar → planejar → corrigir)
-    review_workflow.py # ReviewIssueWorkflow: In Review → review → corrige em loop → follow-ups → merge squash → Done
+    review_workflow.py # ReviewIssueWorkflow: In Review → resolve o repo → review → corrige em loop → follow-ups → merge squash → Done
     skills/writing-plans/, skills/systematic-debugging/, skills/requesting-code-review/, skills/receiving-code-review/  # vendorizadas do superpowers (SKILL.md + LICENSE)
     dispatch.py       # KIND_PLAN/IMPLEMENT/REVIEW, ISSUE_WORKFLOWS, issue_workflow_id, start_issue_workflow
                       # (usado pelo webhook e pela reconciliação)
@@ -130,17 +141,36 @@ tests/                # unittest; payloads.py tem fixtures no formato do Linear
   `ImplementIssueWorkflow` com id `implement-issue-<issue.id>`, ou o `ReviewIssueWorkflow` com id
   `review-issue-<issue.id>`); se já houver um rodando responde
   `{"status": "duplicate"}`; se o Temporal estiver fora, 503 (o Linear reenvia).
+- **Repo de cada issue:** `resolve_repo` (activity) devolve `RepoResolution(target=RepoTarget(repo,
+  test_command))` ou `RepoResolution(problem=...)`. Ordem: (1) **pin**: anexo da issue com URL
+  `https://github.com/<owner>/<repo>/tree/factory/<...>` (vence o projeto; pins de dois repos =
+  problema); (2) o **único** repo do GitHub entre os links dos Resources do projeto do Linear (dedup
+  sem diferenciar maiúsculas; zero ou mais de um = problema; issue sem projeto = problema); (3) o
+  `.factory.toml` da **branch default** desse repo (nunca de `factory/<ID>`), chave obrigatória
+  `test_command` (string não vazia). 4xx do GitHub vira problema; 5xx/rate limit propagam (retry).
+  Cada workflow resolve **uma vez** (`resolve_target`, em `repo_resolution.py`) e passa o `RepoTarget`
+  em todo request de activity que toca o repo: o `PlanIssueWorkflow` **antes** do primeiro
+  `move_issue` (a issue fica em `To Do`); o `ImplementIssueWorkflow` e o `ReviewIssueWorkflow` logo
+  depois da checagem de status (issue fora do status não resolve). Com problema, `resolve_target`
+  posta na issue (`post_comment`, id `workflow.uuid4()`) o comentário "**software-factory não sabe em
+  qual repo trabalhar.**" com o motivo e como corrigir, e falha o workflow sem retry
+  (`ApplicationError(non_retryable=True)`); para tentar de novo, a pessoa corrige o link ou o
+  `.factory.toml` e dispara a etapa de novo.
 - O workflow hoje **gera o plano** com a skill `writing-plans` e o **commita** em
   `docs/superpowers/plans/<IDENTIFIER>.md` na branch `factory/<IDENTIFIER>` (push feito pela
   activity `commit_plan`; o Claude só tem permissão `Edit` nesse arquivo, sem `Bash`). Se a branch
   já existir no remoto com outro conteúdo, falha sem force push.
 - O `ImplementIssueWorkflow` confere que a issue segue em `In Progress` (senão encerra), checa o
   plano via API do GitHub antes de criar sandbox (sem plano → move para `In Planning`), clona
-  `factory/<IDENTIFIER>` (`--depth 50`, para a análise ver o histórico recente) com o token **fora** do `origin` (defesa parcial: o push roda depois no
-  mesmo sandbox em que o Claude teve `Bash`, então o token deve ser tratado como exposto), roda o Claude com `Bash`
-  (`implement_plan`, 30 min, sem retry), roda `TEST_COMMAND` (`run_tests`; timeout de 10 min =
-  vermelho) e destrói o sandbox. Commit/push do orquestrador (`commit_plan`, `commit_implementation`)
-  rodam com `-c core.hooksPath=/dev/null`. Falha da sessão inicial (`implement_plan`) falha o workflow.
+  `factory/<IDENTIFIER>` (`--depth 50`, para a análise ver o histórico recente), roda o Claude com `Bash`
+  (`implement_plan`, 30 min, sem retry), roda o `test_command` (`run_tests`; timeout de 10 min =
+  vermelho) e destrói o sandbox. **Token:** `clone_repo` e `clone_branch` clonam com o token **fora**
+  do `origin` (URL autenticada com `$GITHUB_TOKEN` só em `envs=` do comando de clone; depois
+  `git remote set-url origin` sem token, também em retry); `commit_plan` e `commit_implementation`
+  fazem `ls-remote` e push pela URL autenticada com um token **pedido de novo** ao `TokenProvider`
+  naquela activity (não dependem do token do clone). Defesa parcial: o push roda no mesmo sandbox em
+  que o Claude teve `Bash`, então o token deve ser tratado como exposto. Commit/push do orquestrador
+  (`commit_plan`, `commit_implementation`) rodam com `-c core.hooksPath=/dev/null`. Falha da sessão inicial (`implement_plan`) falha o workflow.
   Verde: push (`commit_implementation`, sem force push; falha se o Claude não mudou nada), abre a
   PR `factory/<ID>` → branch default (reaproveita PR aberta) e move para `In Review`.
 - **Loop de correção (vermelho):** em vez de falhar, repete analisar → planejar → corrigir → testar
@@ -150,7 +180,7 @@ tests/                # unittest; payloads.py tem fixtures no formato do Linear
   vermelha faz push de checkpoint `wip: tentativa <n> de <ID> (testes vermelhos)` em
   `factory/<ID>` (sem force push); a PR só abre com verde. Só as `ATTEMPTS_IN_PROMPT = 3` últimas
   tentativas vão para o prompt (análise truncada em 3000 caracteres). Prompts proíbem
-  apagar/pular/enfraquecer testes e mudar `TEST_COMMAND`.
+  apagar/pular/enfraquecer testes e mudar o `.factory.toml`.
 - **Falha de sessão alimenta o loop:** `implement_fix` que falha (erro, timeout) vira tentativa
   vermelha com saída `implement_fix falhou: <msg>`, com checkpoint `wip: ... (correção falhou)` de
   melhor esforço no mesmo sandbox; `analyze_failure` que falha registra a tentativa
@@ -166,7 +196,7 @@ tests/                # unittest; payloads.py tem fixtures no formato do Linear
   `STATUS_CHECK_RETRY`); resultado `OUTCOME_STOPPED`, sem PR. Falha inesperada: sem compensação,
   issue fica em `In Progress`.
 - **Review (`ReviewIssueWorkflow`, `In Review`):** exige PR aberta de `factory/<ID>` e o status `Done`
-  no time (validado no início). Cada rodada, em um sandbox, roda primeiro `TEST_COMMAND` (`run_tests`,
+  no time (validado no início). Cada rodada, em um sandbox, roda primeiro o `test_command` (`run_tests`,
   12 min, sem retry) no head clonado: vermelho mata o sandbox, entra no `_fix_until_green`, conta
   rodada e volta à review (nada vermelho é revisado nem mergeado). Verde: roda em paralelo as lentes `correctness`
   (`requesting-code-review`) e `security` (dois `claude -p` só leitura) sobre o diff inteiro da PR
@@ -180,7 +210,7 @@ tests/                # unittest; payloads.py tem fixtures no formato do Linear
   `sha` = commit revisado; se o head mudou desde a review (`head_changed`), revisa de novo sem
   perguntar, e isso conta rodada. **Arquivos sensíveis:** `review_pull` calcula, antes de qualquer
   Claude, `git diff --name-only <base_sha> HEAD` filtrado por `SENSITIVE_PATTERNS`
-  (`review_prompts.py`: `CLAUDE.md` (em qualquer diretório), qualquer coisa sob `.claude/`, `.github/workflows/`, `pytest.ini`, `tox.ini`, `setup.cfg`, `pyproject.toml`, `conftest.py`, `.pre-commit-config.yaml` e `Makefile`) em `ReviewReport.sensitive_files`; se não estiver vazio, a review
+  (`review_prompts.py`: `CLAUDE.md` (em qualquer diretório), qualquer coisa sob `.claude/`, `.github/workflows/`, `pytest.ini`, `tox.ini`, `setup.cfg`, `pyproject.toml`, `conftest.py`, `.pre-commit-config.yaml`, `Makefile` e `.factory.toml`) em `ReviewReport.sensitive_files`; se não estiver vazio, a review
   aprovada pergunta no Linear antes do merge e a resposta confirma o merge daquele sha (não pergunta
   de novo pelo mesmo sha). Título, detalhe, motivo e resumo vindos do LLM vão cercados (`_fence`) nos
   prompts. Follow-ups: chave `lens + file + title` (sem a linha), título limitado a 200 caracteres. PR que não pode ser mergeada
@@ -235,8 +265,10 @@ uv venv .venv && source .venv/bin/activate && uv pip install -e ".[dev]"
 # servidor Temporal local (terminal separado) — gRPC localhost:7233, UI http://localhost:8233
 temporal server start-dev --db-filename temporal.db
 
-# worker do Temporal (lê .env; precisa de E2B_API_KEY, ANTHROPIC_API_KEY ou CLAUDE_CODE_OAUTH_TOKEN, GITHUB_TOKEN, TARGET_REPO, LINEAR_API_KEY, TEST_COMMAND;
-# opcional: SMTP_HOST, SMTP_USERNAME, SMTP_PASSWORD, ALERT_EMAIL_TO para o aviso de uso)
+# worker do Temporal (lê .env; precisa de E2B_API_KEY, ANTHROPIC_API_KEY ou CLAUDE_CODE_OAUTH_TOKEN, GITHUB_TOKEN, LINEAR_API_KEY;
+# opcional: SMTP_HOST, SMTP_USERNAME, SMTP_PASSWORD, ALERT_EMAIL_TO para o aviso de uso).
+# Deploy de mudança de assinatura de activity ou da sequência dos workflows (ex.: o repo por issue):
+# sem nenhum plan-issue-*, implement-issue-* ou review-issue-* rodando (espere ou termine-os).
 software-factory-worker
 
 # servidor de webhooks (lê .env)

@@ -10,6 +10,7 @@ from temporalio.worker import Worker
 from software_factory.orchestration.implement_workflow import ImplementIssueWorkflow
 from software_factory.orchestration.models import (
     AnalyzeRequest,
+    BranchRequest,
     Clarification,
     CloneBranchRequest,
     CommentRequest,
@@ -22,6 +23,9 @@ from software_factory.orchestration.models import (
     MoveIssueRequest,
     PlanIssueInput,
     PullRequestRequest,
+    RepoResolution,
+    RepoTarget,
+    RunTestsRequest,
     TestRunResult,
     UsageReportRequest,
 )
@@ -34,6 +38,7 @@ ISSUE = PlanIssueInput(
     url="https://linear.app/acme/issue/ENG-12",
 )
 PR_URL = "https://github.com/acme/app/pull/7"
+TARGET = RepoTarget("acme/app", "pytest")
 
 
 class FakeActivities:
@@ -53,7 +58,9 @@ class FakeActivities:
         fail_fix_times: int = 0,
         fail_analysis_times: int = 0,
         answer_on_poll: str | None = None,
+        repo_problem: str = "",
     ) -> None:
+        self.repo_problem = repo_problem
         self.not_in_progress = not_in_progress
         self.no_plan = no_plan
         # Quantas execuções de run_tests vêm vermelhas antes do verde.
@@ -83,6 +90,10 @@ class FakeActivities:
         self.analyze_requests: list[AnalyzeRequest] = []
         self.fix_requests: list[FixRequest] = []
         self.comments: list[CommentRequest] = []
+        self.plan_requests: list[BranchRequest] = []
+        self.clone_requests: list[CloneBranchRequest] = []
+        self.implement_requests: list[ImplementRequest] = []
+        self.test_requests: list[RunTestsRequest] = []
         self.progress_checks = 0
         self.clones = 0
         self.test_runs = 0
@@ -111,9 +122,17 @@ class FakeActivities:
             return True
         return self.progress_checks - 1 <= self.stop_after_checks
 
+    @activity.defn(name="resolve_repo")
+    async def resolve_repo(self, issue: PlanIssueInput) -> RepoResolution:
+        self.calls.append("resolve_repo")
+        if self.repo_problem:
+            return RepoResolution(problem=self.repo_problem)
+        return RepoResolution(target=TARGET)
+
     @activity.defn(name="plan_exists")
-    async def plan_exists(self, identifier: str) -> bool:
+    async def plan_exists(self, request: BranchRequest) -> bool:
         self.calls.append("plan_exists")
+        self.plan_requests.append(request)
         return not self.no_plan
 
     @activity.defn(name="create_sandbox")
@@ -124,12 +143,14 @@ class FakeActivities:
     @activity.defn(name="clone_branch")
     async def clone_branch(self, request: CloneBranchRequest) -> str:
         self.calls.append("clone_branch")
+        self.clone_requests.append(request)
         self.clones += 1
         return f"sha-{self.clones}"
 
     @activity.defn(name="implement_plan")
     async def implement_plan(self, request: ImplementRequest) -> str:
         self.calls.append("implement_plan")
+        self.implement_requests.append(request)
         if self.fail_implement:
             raise ApplicationError("claude falhou", non_retryable=True)
         return "Implementado."
@@ -175,8 +196,9 @@ class FakeActivities:
         return f"comment-{len(self.comments)}"
 
     @activity.defn(name="run_tests")
-    async def run_tests(self, sandbox_id: str) -> TestRunResult:
+    async def run_tests(self, request: RunTestsRequest) -> TestRunResult:
         self.calls.append("run_tests")
+        self.test_requests.append(request)
         self.test_runs += 1
         return TestRunResult(passed=self.test_runs > self.red_runs, output="FAILED test_a")
 
@@ -219,6 +241,7 @@ class TestImplementIssueWorkflow(unittest.IsolatedAsyncioTestCase):
                 task_queue=task_queue,
                 workflows=[ImplementIssueWorkflow],
                 activities=[
+                    fake.resolve_repo,
                     fake.move_issue,
                     fake.plan_exists,
                     fake.create_sandbox,
@@ -250,6 +273,7 @@ class TestImplementIssueWorkflow(unittest.IsolatedAsyncioTestCase):
             fake.calls,
             [
                 "move_issue:In Progress",
+                "resolve_repo",
                 "plan_exists",
                 "create_sandbox",
                 "clone_branch",
@@ -277,7 +301,7 @@ class TestImplementIssueWorkflow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake.commits[0].message, "feat: implementa ENG-12")
         self.assertIs(fake.commits[0].require_changes, True)
         self.assertEqual(
-            fake.pulls, [PullRequestRequest("ENG-12", "Adicionar login", ISSUE.url)]
+            fake.pulls, [PullRequestRequest("ENG-12", "Adicionar login", ISSUE.url, TARGET)]
         )
 
     async def test_publishes_before_in_review(self) -> None:
@@ -312,12 +336,38 @@ class TestImplementIssueWorkflow(unittest.IsolatedAsyncioTestCase):
         result = await self.run_workflow(fake)
         self.assertEqual(result, ImplementResult("ENG-12", "no_plan"))
         self.assertEqual(
-            fake.calls, ["move_issue:In Progress", "plan_exists", "move_issue:In Planning"]
+            fake.calls,
+            ["move_issue:In Progress", "resolve_repo", "plan_exists", "move_issue:In Planning"],
         )
         self.assertEqual(
             fake.moves[-1],
             MoveIssueRequest("issue-1", to_state="In Planning", from_state="In Progress"),
         )
+
+    async def test_target_reaches_every_repo_activity(self) -> None:
+        fake = FakeActivities(red_runs=1)
+        await self.run_workflow(fake)
+        self.assertEqual(fake.plan_requests, [BranchRequest("ENG-12", TARGET)])
+        self.assertEqual(len(fake.clone_requests), 3)
+        self.assertTrue(all(r.target == TARGET for r in fake.clone_requests))
+        self.assertEqual([r.target for r in fake.implement_requests], [TARGET])
+        self.assertEqual([r.target for r in fake.analyze_requests], [TARGET])
+        self.assertEqual([r.target for r in fake.fix_requests], [TARGET])
+        self.assertEqual(fake.test_requests, [RunTestsRequest("sbx-1", TARGET)] * 2)
+        self.assertEqual([c.target for c in fake.commits], [TARGET, TARGET])
+        self.assertEqual([p.target for p in fake.pulls], [TARGET])
+
+    async def test_repo_problem_after_status_check(self) -> None:
+        fake = FakeActivities(repo_problem="o projeto App não tem link para um repo do GitHub")
+        with self.assertRaises(WorkflowFailureError):
+            await self.run_workflow(fake)
+        self.assertEqual(fake.calls, ["move_issue:In Progress", "resolve_repo", "post_comment"])
+        self.assertIn("o projeto App não tem link", fake.comments[0].body)
+
+    async def test_skipped_issue_does_not_resolve(self) -> None:
+        fake = FakeActivities(not_in_progress=True)
+        await self.run_workflow(fake)
+        self.assertNotIn("resolve_repo", fake.calls)
 
     async def test_red_then_fixed_opens_pr(self) -> None:
         fake = FakeActivities(red_runs=1)
@@ -327,6 +377,7 @@ class TestImplementIssueWorkflow(unittest.IsolatedAsyncioTestCase):
             fake.calls,
             [
                 "move_issue:In Progress",
+                "resolve_repo",
                 "plan_exists",
                 "create_sandbox",
                 "clone_branch",

@@ -44,6 +44,7 @@ SENSITIVE_PATTERNS = (
     "conftest.py",
     ".pre-commit-config.yaml",
     "Makefile",
+    ".factory.toml",
 )
 
 _FINDING_FIELDS = ("lens", "severity", "file", "line", "title", "detail", "decision", "reason")

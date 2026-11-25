@@ -8,12 +8,14 @@ with workflow.unsafe.imports_passed_through():
         STATE_IN_PLANNING,
         STATE_IN_PROGRESS,
         STATE_TODO,
+        CloneRepoRequest,
         CommitPlanRequest,
         MoveIssueRequest,
         PlanIssueInput,
         PlanRequest,
         PlanResult,
     )
+    from software_factory.orchestration.repo_resolution import resolve_target
     from software_factory.orchestration.token_reporting import publish_token_usage
 
 MOVE_ISSUE_TIMEOUT = timedelta(seconds=30)
@@ -29,6 +31,8 @@ class PlanIssueWorkflow:
 
     @workflow.run
     async def run(self, issue: PlanIssueInput) -> PlanResult:
+        # Antes de mover: issue sem repo resolvido não sai de To Do.
+        target = await resolve_target(issue)
         # Só sai de To Do: issue que recebeu a label em outro status é planejada sem mover.
         # In Progress é validado já aqui para não descobrir no fim, com o plano já commitado.
         moved: bool = await workflow.execute_activity(
@@ -54,7 +58,7 @@ class PlanIssueWorkflow:
         try:
             await workflow.execute_activity(
                 "clone_repo",
-                sandbox_id,
+                CloneRepoRequest(sandbox_id=sandbox_id, target=target),
                 start_to_close_timeout=timedelta(minutes=5),
                 retry_policy=RetryPolicy(maximum_attempts=3),
             )
@@ -68,7 +72,9 @@ class PlanIssueWorkflow:
             )
             branch: str = await workflow.execute_activity(
                 "commit_plan",
-                CommitPlanRequest(sandbox_id=sandbox_id, identifier=issue.identifier),
+                CommitPlanRequest(
+                    sandbox_id=sandbox_id, identifier=issue.identifier, target=target
+                ),
                 start_to_close_timeout=timedelta(minutes=3),
                 retry_policy=RetryPolicy(maximum_attempts=3),
                 result_type=str,

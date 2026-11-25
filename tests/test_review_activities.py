@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import json
 import unittest
 from typing import Any
@@ -14,6 +15,7 @@ from software_factory.orchestration.activities import (
     SandboxActivities,
 )
 from software_factory.orchestration.models import (
+    RepoTarget,
     ReviewFinding,
     ReviewFixRequest,
     ReviewReport,
@@ -37,6 +39,7 @@ from software_factory.orchestration.review_prompts import (
 from tests.test_activities import (
     ISSUE,
     SETTINGS,
+    TARGET,
     USAGE_EVENT,
     USAGE_RESET,
     FakeNotifier,
@@ -66,7 +69,9 @@ class TestReviewActivities(unittest.IsolatedAsyncioTestCase):
         self.env = ActivityEnvironment()
         self.heartbeats: list[Any] = []
         self.env.on_heartbeat = lambda *details: self.heartbeats.append(details)
-        self.request = ReviewRequest(sandbox_id="sbx-1", issue=ISSUE, base_sha=BASE_SHA)
+        self.request = ReviewRequest(
+            sandbox_id="sbx-1", issue=ISSUE, base_sha=BASE_SHA, target=TARGET
+        )
         FakeSandbox.instance.commands.stdout = stream(
             {"type": "result", "subtype": "success", "result": "Relatório salvo."}
         )
@@ -163,6 +168,13 @@ class TestReviewActivities(unittest.IsolatedAsyncioTestCase):
             self.assertIn(path, written)
             self.assertNotIn("gh-token", written[path])
 
+    async def test_review_pull_fetches_from_target_repo(self) -> None:
+        self.claude_reviews()
+        request = dataclasses.replace(self.request, target=RepoTarget("acme/api", "x"))
+        await self.env.run(self.activities.review_pull, request)
+        (fetch,) = [r for r in FakeSandbox.instance.commands.runs if "git fetch" in r["cmd"]]
+        self.assertIn("x-access-token:$GITHUB_TOKEN@github.com/acme/api.git", fetch["cmd"])
+
     async def test_review_pull_flags_sensitive_files_before_claude(self) -> None:
         self.claude_reviews()
         FakeSandbox.instance.commands.responses = {
@@ -188,7 +200,9 @@ class TestReviewActivities(unittest.IsolatedAsyncioTestCase):
 
     async def test_review_pull_rejects_unsafe_base_sha(self) -> None:
         self.claude_reviews()
-        request = ReviewRequest(sandbox_id="sbx-1", issue=ISSUE, base_sha="main; rm -rf /")
+        request = ReviewRequest(
+            sandbox_id="sbx-1", issue=ISSUE, base_sha="main; rm -rf /", target=TARGET
+        )
         with self.assertRaises(ApplicationError) as ctx:
             await self.env.run(self.activities.review_pull, request)
         self.assertTrue(ctx.exception.non_retryable)
@@ -214,7 +228,11 @@ class TestReviewActivities(unittest.IsolatedAsyncioTestCase):
             {"type": "result", "subtype": "success", "result": "Corrigi o achado 1."}
         )
         request = ReviewFixRequest(
-            sandbox_id="sbx-1", issue=ISSUE, round=1, findings=(ReviewFinding(**FINDING),)
+            sandbox_id="sbx-1",
+            issue=ISSUE,
+            round=1,
+            findings=(ReviewFinding(**FINDING),),
+            target=RepoTarget("acme/app", "npm test"),
         )
         notes = await self.env.run(self.activities.implement_review_fix, request)
         self.assertEqual(notes, "Corrigi o achado 1.")
@@ -225,6 +243,7 @@ class TestReviewActivities(unittest.IsolatedAsyncioTestCase):
         self.assertIn(REVIEW_FIX_PROMPT_PATH, run["cmd"])
         self.assertIn('--allowedTools "Read,Grep,Glob,Skill,Edit,Write,Bash"', run["cmd"])
         self.assertEqual(run["timeout"], IMPLEMENT_COMMAND_TIMEOUT_S)
+        self.assertIn("`npm test`", written[REVIEW_FIX_PROMPT_PATH])
 
     async def test_install_skills_copies_review_skills(self) -> None:
         from software_factory.orchestration.activities import install_skills
