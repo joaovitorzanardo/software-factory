@@ -13,6 +13,7 @@ from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
 from software_factory.config import FactorySettings
+from software_factory.github.client import static_token
 from software_factory.orchestration.activities import (
     ANALYSIS_PATH,
     FIX_DIR,
@@ -337,10 +338,13 @@ class TestPlanPath(unittest.TestCase):
             self.assertTrue(ctx.exception.non_retryable)
 
 
+AUTHED_URL = '"https://x-access-token:$GITHUB_TOKEN@github.com/acme/app.git"'
+
+
 class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         FakeSandbox.reset()
-        self.activities = SandboxActivities(SETTINGS, sandbox_cls=FakeSandbox)
+        self.activities = SandboxActivities(SETTINGS, static_token("gh-token"), sandbox_cls=FakeSandbox)
         self.env = ActivityEnvironment()
         self.heartbeats: list[Any] = []
         self.env.on_heartbeat = lambda *details: self.heartbeats.append(details)
@@ -375,23 +379,34 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
 
     async def test_create_sandbox_with_oauth_token(self) -> None:
         settings = replace(SETTINGS, anthropic_api_key=None, claude_code_oauth_token="oat-token")
-        activities = SandboxActivities(settings, sandbox_cls=FakeSandbox)
+        activities = SandboxActivities(settings, static_token("gh-token"), sandbox_cls=FakeSandbox)
         await self.env.run(activities.create_sandbox, "issue-1")
         (call,) = FakeSandbox.create_calls
         self.assertEqual(call["envs"], {"CLAUDE_CODE_OAUTH_TOKEN": "oat-token"})
 
     async def test_clone_repo(self) -> None:
         await self.env.run(self.activities.clone_repo, "sbx-1")
-        (run,) = FakeSandbox.instance.commands.runs
+        run = FakeSandbox.instance.commands.runs[0]
         self.assertIn("git clone --depth 1", run["cmd"])
         self.assertIn("github.com/acme/app.git", run["cmd"])
         self.assertNotIn("gh-token", run["cmd"])
         self.assertEqual(run["envs"], {"GITHUB_TOKEN": "gh-token"})
 
+    async def test_clone_repo_leaves_no_token_in_origin(self) -> None:
+        await self.env.run(self.activities.clone_repo, "sbx-1")
+        runs = FakeSandbox.instance.commands.runs
+        self.assertEqual(runs[0]["envs"], {"GITHUB_TOKEN": "gh-token"})
+        self.assertIn(
+            "git remote set-url origin https://github.com/acme/app.git",
+            [r["cmd"] for r in runs],
+        )
+        self.assertFalse(any("gh-token" in r["cmd"] for r in runs))
+
     async def test_clone_repo_skips_existing(self) -> None:
         FakeSandbox.instance.files.existing.add(f"{REPO_DIR}/.git")
         await self.env.run(self.activities.clone_repo, "sbx-1")
-        self.assertEqual(FakeSandbox.instance.commands.runs, [])
+        cmds = [r["cmd"] for r in FakeSandbox.instance.commands.runs]
+        self.assertEqual(cmds, ["git remote set-url origin https://github.com/acme/app.git"])
 
     def claude_saves_plan(self, content: str = "# Plano\n1. fazer") -> None:
         files = FakeSandbox.instance.files
@@ -483,13 +498,37 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
                 ' -c user.email="software-factory@users.noreply.github.com"'
                 ' commit -m "docs: plano de implementação ENG-12"',
                 "git rev-parse HEAD",
-                "git ls-remote --heads origin refs/heads/factory/ENG-12",
-                "git -c core.hooksPath=/dev/null push -u origin factory/ENG-12",
+                f"git ls-remote --heads {AUTHED_URL} refs/heads/factory/ENG-12",
+                f"git -c core.hooksPath=/dev/null push {AUTHED_URL} HEAD:refs/heads/factory/ENG-12",
             ],
         )
         for run in FakeSandbox.instance.commands.runs:
             self.assertEqual(run["cwd"], REPO_DIR)
             self.assertNotIn("gh-token", run["cmd"])
+
+    async def test_commit_plan_pushes_with_fresh_token(self) -> None:
+        calls = 0
+
+        async def tokens(repo: str) -> str:
+            nonlocal calls
+            calls += 1
+            return f"tok-{calls}"
+
+        activities = SandboxActivities(SETTINGS, tokens, sandbox_cls=FakeSandbox)
+        await self.env.run(activities.clone_repo, "sbx-1")
+        FakeSandbox.instance.files.existing.add(PLAN_FILE)
+        FakeSandbox.instance.commands.responses = {"rev-parse": "abc123\n", "ls-remote": ""}
+        await self.env.run(
+            activities.commit_plan, CommitPlanRequest(sandbox_id="sbx-1", identifier="ENG-12")
+        )
+        runs = FakeSandbox.instance.commands.runs
+        push = next(r for r in runs if " push " in r["cmd"])
+        self.assertIn("x-access-token:$GITHUB_TOKEN@github.com/acme/app.git", push["cmd"])
+        self.assertEqual(push["envs"], {"GITHUB_TOKEN": "tok-2"})
+        ls_remote = next(r for r in runs if "ls-remote" in r["cmd"])
+        self.assertIn("x-access-token:$GITHUB_TOKEN@github.com/acme/app.git", ls_remote["cmd"])
+        self.assertEqual(ls_remote["envs"], {"GITHUB_TOKEN": "tok-2"})
+        self.assertEqual(calls, 2)  # clone_repo + commit_plan (uma vez)
 
     async def test_commit_plan_idempotent_after_push(self) -> None:
         branch = await self.run_commit_plan(remote="abc123\trefs/heads/factory/ENG-12\n")
@@ -573,7 +612,7 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
             )
 
     def with_notifier(self, notifier: FakeNotifier) -> SandboxActivities:
-        return SandboxActivities(SETTINGS, sandbox_cls=FakeSandbox, usage_notifier=notifier)
+        return SandboxActivities(SETTINGS, static_token("gh-token"), sandbox_cls=FakeSandbox, usage_notifier=notifier)
 
     async def test_implement_plan_notifies_usage(self) -> None:
         notifier = FakeNotifier()
@@ -621,7 +660,7 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
         env = ActivityEnvironment()
         env.info = replace(env.info, workflow_id=workflow_id)
         activities = SandboxActivities(
-            SETTINGS, sandbox_cls=FakeSandbox, token_store=store, **kwargs
+            SETTINGS, static_token("gh-token"), sandbox_cls=FakeSandbox, token_store=store, **kwargs
         )
         return activities, env
 

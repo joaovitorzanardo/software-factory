@@ -111,3 +111,23 @@ class GitHubClient:
 
 # repo (`owner/repo`) -> cliente autenticado para ele
 GitHubClients = Callable[[str], Awaitable[GitHubClient]]
+# repo (`owner/repo`) -> token de acesso a esse repo.
+TokenProvider = Callable[[str], Awaitable[str]]
+
+
+def static_token(token: str) -> TokenProvider:
+    """Provider que devolve o mesmo token (o PAT) para qualquer repo."""
+
+    async def provide(repo: str) -> str:
+        return token
+
+    return provide
+
+
+def github_clients(tokens: TokenProvider) -> GitHubClients:
+    """Monta `GitHubClients`: um `GitHubClient` por repo, com o token de `tokens(repo)`."""
+
+    async def build(repo: str) -> GitHubClient:
+        return GitHubClient(await tokens(repo), repo)
+
+    return build

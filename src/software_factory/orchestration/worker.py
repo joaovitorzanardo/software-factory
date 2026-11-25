@@ -6,7 +6,7 @@ from temporalio.client import Client
 from temporalio.worker import Worker
 
 from software_factory.config import FactorySettings
-from software_factory.github.client import GitHubClient
+from software_factory.github.client import GitHubClient, static_token
 from software_factory.linear.client import LinearClient
 from software_factory.orchestration.activities import SandboxActivities
 from software_factory.orchestration.token_activities import TokenUsageActivities
@@ -41,7 +41,12 @@ async def run_worker(settings: FactorySettings) -> None:
     else:
         logger.info("aviso de uso desligado: SMTP_HOST não definida")
     token_store = TokenStore(settings.token_usage_db)
-    activities = SandboxActivities(settings, usage_notifier=notifier, token_store=token_store)
+    activities = SandboxActivities(
+        settings,
+        static_token(settings.github_token),
+        usage_notifier=notifier,
+        token_store=token_store,
+    )
     tokens = TokenUsageActivities(token_store)
     review = ReviewActivities(activities)
     linear_client = LinearClient(settings.linear_api_key)
