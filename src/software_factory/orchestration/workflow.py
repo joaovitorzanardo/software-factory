@@ -2,12 +2,14 @@ from datetime import timedelta
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
+from temporalio.exceptions import ActivityError
 
 with workflow.unsafe.imports_passed_through():
     from software_factory.orchestration.models import (
         STATE_IN_PLANNING,
         STATE_IN_PROGRESS,
         STATE_TODO,
+        AttachLinkRequest,
         CloneRepoRequest,
         CommitPlanRequest,
         MoveIssueRequest,
@@ -16,6 +18,7 @@ with workflow.unsafe.imports_passed_through():
         PlanResult,
     )
     from software_factory.orchestration.repo_resolution import resolve_target
+    from software_factory.orchestration.repos import pin_url
     from software_factory.orchestration.token_reporting import publish_token_usage
 
 MOVE_ISSUE_TIMEOUT = timedelta(seconds=30)
@@ -85,6 +88,23 @@ class PlanIssueWorkflow:
                 sandbox_id,
                 start_to_close_timeout=timedelta(minutes=1),
                 retry_policy=RetryPolicy(maximum_attempts=5),
+            )
+        # Pin do repo: vence o link do projeto nas próximas etapas. Falha só loga.
+        try:
+            await workflow.execute_activity(
+                "attach_link",
+                AttachLinkRequest(
+                    issue_id=issue.issue_id,
+                    url=pin_url(target.repo, issue.identifier),
+                    title=f"factory/{issue.identifier}",
+                    subtitle=target.repo,
+                ),
+                start_to_close_timeout=MOVE_ISSUE_TIMEOUT,
+                retry_policy=RetryPolicy(maximum_attempts=5),
+            )
+        except ActivityError as error:
+            workflow.logger.warning(
+                "não fixou o repo de %s na issue: %s", issue.identifier, error
             )
         await publish_token_usage(issue.issue_id)
         await workflow.execute_activity(

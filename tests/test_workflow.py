@@ -8,6 +8,7 @@ from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from software_factory.orchestration.models import (
+    AttachLinkRequest,
     CloneRepoRequest,
     CommentRequest,
     CommitPlanRequest,
@@ -40,7 +41,10 @@ class FakeActivities:
         skip_planning_move: bool = False,
         fail_planning_move: bool = False,
         repo_problem: str = "",
+        fail_attach: bool = False,
     ) -> None:
+        self.fail_attach = fail_attach
+        self.attachments: list[AttachLinkRequest] = []
         self.repo_problem = repo_problem
         self.fail_plan = fail_plan
         self.fail_commit = fail_commit
@@ -64,6 +68,13 @@ class FakeActivities:
         self.calls.append("post_comment")
         self.comments.append(request)
         return request.comment_id
+
+    @activity.defn(name="attach_link")
+    async def attach_link(self, request: AttachLinkRequest) -> None:
+        self.calls.append("attach_link")
+        self.attachments.append(request)
+        if self.fail_attach:
+            raise ApplicationError("issue não encontrada", non_retryable=True)
 
     @activity.defn(name="move_issue")
     async def move_issue(self, request: MoveIssueRequest) -> bool:
@@ -128,6 +139,7 @@ class TestPlanIssueWorkflow(unittest.IsolatedAsyncioTestCase):
                     fake.resolve_repo,
                     fake.post_comment,
                     fake.move_issue,
+                    fake.attach_link,
                     fake.create_sandbox,
                     fake.clone_repo,
                     fake.generate_plan,
@@ -166,6 +178,7 @@ class TestPlanIssueWorkflow(unittest.IsolatedAsyncioTestCase):
                 "generate_plan",
                 "commit_plan",
                 "kill_sandbox",
+                "attach_link",
                 "token_usage_report:final=False",
                 "upsert_comment",
                 "move_issue:In Progress",
@@ -188,10 +201,11 @@ class TestPlanIssueWorkflow(unittest.IsolatedAsyncioTestCase):
         fake = FakeActivities()
         await self.run_workflow(fake)
         self.assertEqual(
-            fake.calls[-5:],
+            fake.calls[-6:],
             [
                 "commit_plan",
                 "kill_sandbox",
+                "attach_link",
                 "token_usage_report:final=False",
                 "upsert_comment",
                 "move_issue:In Progress",
@@ -232,6 +246,31 @@ class TestPlanIssueWorkflow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake.calls[0], "resolve_repo")
         self.assertEqual(fake.clone_requests, [CloneRepoRequest("sbx-1", TARGET)])
         self.assertEqual(fake.commit_requests[0].target, TARGET)
+
+    async def test_pins_repo_after_commit(self) -> None:
+        fake = FakeActivities()
+        await self.run_workflow(fake)
+        self.assertEqual(
+            fake.attachments,
+            [
+                AttachLinkRequest(
+                    "issue-1",
+                    "https://github.com/acme/app/tree/factory/ENG-12",
+                    "factory/ENG-12",
+                    "acme/app",
+                )
+            ],
+        )
+        self.assertLess(fake.calls.index("kill_sandbox"), fake.calls.index("attach_link"))
+        self.assertLess(
+            fake.calls.index("attach_link"), fake.calls.index("token_usage_report:final=False")
+        )
+
+    async def test_pin_failure_still_moves_to_in_progress(self) -> None:
+        fake = FakeActivities(fail_attach=True)
+        result = await self.run_workflow(fake)
+        self.assertEqual(result.branch, "factory/ENG-12")
+        self.assertEqual(fake.calls[-1], "move_issue:In Progress")
 
     async def test_repo_problem_comments_and_fails(self) -> None:
         fake = FakeActivities(repo_problem="o projeto App não tem link para um repo do GitHub")

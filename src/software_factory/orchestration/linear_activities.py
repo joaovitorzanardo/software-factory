@@ -3,6 +3,7 @@ from temporalio.exceptions import ApplicationError
 
 from software_factory.linear.client import LinearClient
 from software_factory.orchestration.models import (
+    AttachLinkRequest,
     CommentRequest,
     CreateIssueRequest,
     FollowUpIssue,
@@ -52,6 +53,18 @@ query($originId: String!) {
 ISSUE_CREATE_MUTATION = """
 mutation($input: IssueCreateInput!) {
   issueCreate(input: $input) { success issue { identifier url } }
+}
+"""
+
+ATTACHMENTS_QUERY = """
+query($id: String!) {
+  issue(id: $id) { attachments(first: 100) { nodes { url } } }
+}
+"""
+
+ATTACHMENT_CREATE_MUTATION = """
+mutation($input: AttachmentCreateInput!) {
+  attachmentCreate(input: $input) { success }
 }
 """
 
@@ -199,3 +212,30 @@ class LinearActivities:
             "follow-up %s criado a partir da issue %s", issue["identifier"], request.origin_issue_id
         )
         return FollowUpIssue(identifier=issue["identifier"], url=issue["url"])
+
+    @activity.defn
+    async def attach_link(self, request: AttachLinkRequest) -> None:
+        """Anexa o link à issue; idempotente pela URL (já anexada: sem mutation)."""
+        data = await self.client.execute(ATTACHMENTS_QUERY, {"id": request.issue_id})
+        issue = data.get("issue")
+        if issue is None:
+            raise ApplicationError(
+                f"issue {request.issue_id} não encontrada no Linear", non_retryable=True
+            )
+        if any(node["url"] == request.url for node in issue["attachments"]["nodes"]):
+            return
+
+        result = await self.client.execute(
+            ATTACHMENT_CREATE_MUTATION,
+            {
+                "input": {
+                    "issueId": request.issue_id,
+                    "url": request.url,
+                    "title": request.title,
+                    "subtitle": request.subtitle,
+                }
+            },
+        )
+        if not result["attachmentCreate"]["success"]:
+            raise ApplicationError(f"Linear não anexou o link na issue {request.issue_id}")
+        activity.logger.info("link %s anexado à issue %s", request.url, request.issue_id)

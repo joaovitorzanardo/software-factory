@@ -220,6 +220,10 @@ tests/                # unittest; payloads.py tem fixtures no formato do Linear
   o workflow pergunta como seguir; a resposta zera o contador. Parar: mover a issue para fora de
   `In Review` (checado antes de cada rodada e na espera; `OUTCOME_STOPPED`, sem merge). Merge feito:
   issue vai para `Done`. A branch `factory/<ID>` não é apagada.
+- **Pin do repo:** depois do commit do plano e do kill do sandbox, `attach_link` (`linear_activities.py`,
+  idempotente pela URL) grava na issue o anexo `factory/<ID>` (URL `pin_url`, subtítulo = repo). O pin
+  vence o link do projeto do Linear nas etapas seguintes. Falha do anexo só loga (`workflow.logger.warning`).
+  Para trocar o repo de uma issue já planejada, apague o anexo `factory/<ID>`.
 - Status no Linear: o workflow começa movendo a issue `To Do → In Planning` (só se estiver em
   `To Do`; senão planeja sem mover) e, depois do commit do plano e do kill do sandbox, move para
   `In Progress`. Status procurados por nome (case-insensitive) no time da issue; status inexistente

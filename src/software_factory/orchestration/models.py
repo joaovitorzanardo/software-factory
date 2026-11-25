@@ -51,6 +51,14 @@ class PlanResult:
 
 
 @dataclass(frozen=True)
+class AttachLinkRequest:
+    issue_id: str
+    url: str
+    title: str
+    subtitle: str
+
+
+@dataclass(frozen=True)
 class MoveIssueRequest:
     issue_id: str
     to_state: str

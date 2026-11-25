@@ -79,6 +79,7 @@ async def run_worker(settings: FactorySettings) -> None:
             linear.post_comment,
             linear.upsert_comment,
             linear.create_issue,
+            linear.attach_link,
             tokens.token_usage_report,
             github.plan_exists,
             github.open_pull_request,
