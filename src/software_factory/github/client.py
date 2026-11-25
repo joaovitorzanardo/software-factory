@@ -1,3 +1,4 @@
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
@@ -107,3 +108,6 @@ class GitHubClient:
             json={"title": title, "head": head, "base": base, "body": body},
         )
         return response.json()["html_url"]
+
+# repo (`owner/repo`) -> cliente autenticado para ele
+GitHubClients = Callable[[str], Awaitable[GitHubClient]]

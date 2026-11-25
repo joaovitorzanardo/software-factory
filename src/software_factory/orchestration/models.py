@@ -294,3 +294,15 @@ class UsageAlert:
     utilization: float
     resets_at: int  # epoch em segundos
     source: str = ""  # <workflow_id>/<activity> que detectou
+
+
+@dataclass(frozen=True)
+class RepoTarget:
+    repo: str  # owner/repo
+    test_command: str
+
+
+@dataclass(frozen=True)
+class RepoResolution:
+    target: RepoTarget | None = None
+    problem: str = ""  # motivo (pt-BR) de não ter resolvido o repo
