@@ -25,10 +25,12 @@ Software factory experimental (fase de teste). O objetivo é automatizar o ciclo
   `ANTHROPIC_API_KEY` (API) ou `CLAUDE_CODE_OAUTH_TOKEN` (assinatura, `claude setup-token`;
   zona cinzenta nos termos para automação em sandbox de terceiro).
 - **Git/PR:** GitHub; o repo alvo é **resolvido por issue** (activity `resolve_repo`, ver "Repo de
-  cada issue"), clonado no sandbox com `GITHUB_TOKEN` fine-grained com acesso aos repos dos
-  projetos, com **Contents: Read and write** (push da branch) e **Pull requests: Read and write**
-  (abertura da PR). As activities pedem o token a um `TokenProvider` (repo → token; hoje
-  `static_token(GITHUB_TOKEN)`) e a API a um `GitHubClients` (repo → `GitHubClient`,
+  cada issue"), clonado no sandbox com um token de instalação de um **GitHub App**
+  (`GITHUB_APP_ID` + `GITHUB_APP_PRIVATE_KEY_PATH`; JWT RS256 com `pyjwt[crypto]`, permissões
+  **Contents: Read and write** (push da branch), **Pull requests: Read and write** (abertura da PR)
+  e Metadata: Read). O token é restrito ao repo da issue, vale 1h e é renovado com 10 min de margem;
+  a instalação do App é a allowlist de repos. As activities pedem o token a um `TokenProvider`
+  (repo → token; `GitHubApp.installation_token`) e a API a um `GitHubClients` (repo → `GitHubClient`,
   `github_clients`). API REST do GitHub (`https://api.github.com`) chamada com `httpx` puro
   (`github/client.py`, sem SDK).
 - **Testes do repo alvo:** `test_command` do `.factory.toml` na raiz do repo alvo (lido da branch
@@ -72,8 +74,9 @@ src/software_factory/
   notify/
     email.py          # EmailSettings (SMTP_*, ALERT_EMAIL_*, ALERT_TIMEZONE), build_usage_alert_email, send_email
   github/
+    app.py            # GitHubApp: JWT RS256 + token de instalação por repo, em cache com 10 min de margem
     client.py         # GitHubClient: REST com httpx (default_branch, get_file, find_open_pull, create_pull);
-                      # TokenProvider/static_token e GitHubClients/github_clients (um client por repo)
+                      # TokenProvider e GitHubClients/github_clients (um client por repo)
   orchestration/
     models.py         # dataclasses de entrada/saída (PlanIssueInput, PlanRequest, CommitPlanRequest,
                       # MoveIssueRequest, PlanResult, CloneBranchRequest, ImplementRequest, TestRunResult,
@@ -169,7 +172,7 @@ tests/                # unittest; payloads.py tem fixtures no formato do Linear
   `git remote set-url origin` sem token, também em retry); `commit_plan` e `commit_implementation`
   fazem `ls-remote` e push pela URL autenticada com um token **pedido de novo** ao `TokenProvider`
   naquela activity (não dependem do token do clone). Defesa parcial: o push roda no mesmo sandbox em
-  que o Claude teve `Bash`, então o token deve ser tratado como exposto. Commit/push do orquestrador
+  que o Claude teve `Bash`, então o token deve ser tratado como exposto (o alcance é um repo, por até 1h). Commit/push do orquestrador
   (`commit_plan`, `commit_implementation`) rodam com `-c core.hooksPath=/dev/null`. Falha da sessão inicial (`implement_plan`) falha o workflow.
   Verde: push (`commit_implementation`, sem force push; falha se o Claude não mudou nada), abre a
   PR `factory/<ID>` → branch default (reaproveita PR aberta) e move para `In Review`.
@@ -269,7 +272,7 @@ uv venv .venv && source .venv/bin/activate && uv pip install -e ".[dev]"
 # servidor Temporal local (terminal separado) — gRPC localhost:7233, UI http://localhost:8233
 temporal server start-dev --db-filename temporal.db
 
-# worker do Temporal (lê .env; precisa de E2B_API_KEY, ANTHROPIC_API_KEY ou CLAUDE_CODE_OAUTH_TOKEN, GITHUB_TOKEN, LINEAR_API_KEY;
+# worker do Temporal (lê .env; precisa de E2B_API_KEY, ANTHROPIC_API_KEY ou CLAUDE_CODE_OAUTH_TOKEN, GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY_PATH, LINEAR_API_KEY;
 # opcional: SMTP_HOST, SMTP_USERNAME, SMTP_PASSWORD, ALERT_EMAIL_TO para o aviso de uso).
 # Deploy de mudança de assinatura de activity ou da sequência dos workflows (ex.: o repo por issue):
 # sem nenhum plan-issue-*, implement-issue-* ou review-issue-* rodando (espere ou termine-os).

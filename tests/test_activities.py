@@ -13,7 +13,6 @@ from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
 from software_factory.config import FactorySettings
-from software_factory.github.client import static_token
 from software_factory.orchestration.activities import (
     ANALYSIS_PATH,
     FIX_DIR,
@@ -54,9 +53,31 @@ from tests.stream_samples import INIT_EVENT, ASSISTANT_EVENT, RESULT_EVENT
 SETTINGS = FactorySettings(
     e2b_api_key="e2b-key",
     anthropic_api_key="anthropic-key",
-    github_token="gh-token",
+    github_app_id="123",
+    github_app_private_key="-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----",
     linear_api_key="lin-key",
 )
+
+PEM = "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n"
+KEY_PATH = ""
+_key_dir = tempfile.TemporaryDirectory()
+
+
+def setUpModule() -> None:
+    global KEY_PATH
+    KEY_PATH = os.path.join(_key_dir.name, "app.pem")
+    with open(KEY_PATH, "w") as f:
+        f.write(PEM)
+
+
+def tearDownModule() -> None:
+    _key_dir.cleanup()
+
+
+async def tokens(repo: str) -> str:
+    return "gh-token"
+
+
 TARGET = RepoTarget("acme/app", "python -m pytest")
 
 ISSUE = PlanIssueInput(
@@ -207,7 +228,8 @@ class TestFactorySettings(unittest.TestCase):
         env = {
             "E2B_API_KEY": "e2b-key",
             "ANTHROPIC_API_KEY": "anthropic-key",
-            "GITHUB_TOKEN": "gh-token",
+            "GITHUB_APP_ID": "123",
+            "GITHUB_APP_PRIVATE_KEY_PATH": KEY_PATH,
         }
         with mock.patch.dict(os.environ, env, clear=True):
             with self.assertRaises(RuntimeError):
@@ -215,11 +237,59 @@ class TestFactorySettings(unittest.TestCase):
         with mock.patch.dict(os.environ, {**env, "LINEAR_API_KEY": "lin-key"}, clear=True):
             self.assertEqual(FactorySettings.from_env().linear_api_key, "lin-key")
 
+    def test_from_env_reads_app_private_key_file(self) -> None:
+        env = {
+            "E2B_API_KEY": "e2b-key",
+            "ANTHROPIC_API_KEY": "anthropic-key",
+            "GITHUB_APP_ID": "123",
+            "GITHUB_APP_PRIVATE_KEY_PATH": KEY_PATH,
+            "LINEAR_API_KEY": "lin-key",
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            settings = FactorySettings.from_env()
+        self.assertEqual(settings.github_app_id, "123")
+        self.assertTrue(settings.github_app_private_key.startswith("-----BEGIN"))
+
+    def test_from_env_requires_app_id(self) -> None:
+        env = {
+            "E2B_API_KEY": "e2b-key",
+            "ANTHROPIC_API_KEY": "anthropic-key",
+            "GITHUB_APP_PRIVATE_KEY_PATH": KEY_PATH,
+            "LINEAR_API_KEY": "lin-key",
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "GITHUB_APP_ID não definida"):
+                FactorySettings.from_env()
+
+    def test_from_env_missing_key_file(self) -> None:
+        env = {
+            "E2B_API_KEY": "e2b-key",
+            "ANTHROPIC_API_KEY": "anthropic-key",
+            "GITHUB_APP_ID": "123",
+            "GITHUB_APP_PRIVATE_KEY_PATH": os.path.join(_key_dir.name, "nao-existe.pem"),
+            "LINEAR_API_KEY": "lin-key",
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "GITHUB_APP_PRIVATE_KEY_PATH"):
+                FactorySettings.from_env()
+
+    def test_from_env_no_longer_needs_github_token(self) -> None:
+        env = {
+            "E2B_API_KEY": "e2b-key",
+            "ANTHROPIC_API_KEY": "anthropic-key",
+            "GITHUB_APP_ID": "123",
+            "GITHUB_APP_PRIVATE_KEY_PATH": KEY_PATH,
+            "LINEAR_API_KEY": "lin-key",
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertFalse(hasattr(FactorySettings.from_env(), "github_token"))
+
     def test_from_env_without_target_repo_and_test_command(self) -> None:
         env = {
             "E2B_API_KEY": "e2b-key",
             "ANTHROPIC_API_KEY": "anthropic-key",
-            "GITHUB_TOKEN": "gh-token",
+            "GITHUB_APP_ID": "123",
+            "GITHUB_APP_PRIVATE_KEY_PATH": KEY_PATH,
             "LINEAR_API_KEY": "lin-key",
         }
         with mock.patch.dict(os.environ, env, clear=True):
@@ -231,7 +301,8 @@ class TestFactorySettings(unittest.TestCase):
         env = {
             "E2B_API_KEY": "e2b-key",
             "ANTHROPIC_API_KEY": "anthropic-key",
-            "GITHUB_TOKEN": "gh-token",
+            "GITHUB_APP_ID": "123",
+            "GITHUB_APP_PRIVATE_KEY_PATH": KEY_PATH,
             "LINEAR_API_KEY": "lin-key",
         }
         with mock.patch.dict(os.environ, env, clear=True):
@@ -243,7 +314,8 @@ class TestFactorySettings(unittest.TestCase):
         env = {
             "E2B_API_KEY": "e2b-key",
             "ANTHROPIC_API_KEY": "anthropic-key",
-            "GITHUB_TOKEN": "gh-token",
+            "GITHUB_APP_ID": "123",
+            "GITHUB_APP_PRIVATE_KEY_PATH": KEY_PATH,
             "LINEAR_API_KEY": "lin-key",
         }
         with mock.patch.dict(os.environ, env, clear=True):
@@ -346,7 +418,7 @@ AUTHED_URL = '"https://x-access-token:$GITHUB_TOKEN@github.com/acme/app.git"'
 class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         FakeSandbox.reset()
-        self.activities = SandboxActivities(SETTINGS, static_token("gh-token"), sandbox_cls=FakeSandbox)
+        self.activities = SandboxActivities(SETTINGS, tokens, sandbox_cls=FakeSandbox)
         self.env = ActivityEnvironment()
         self.heartbeats: list[Any] = []
         self.env.on_heartbeat = lambda *details: self.heartbeats.append(details)
@@ -381,7 +453,7 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
 
     async def test_create_sandbox_with_oauth_token(self) -> None:
         settings = replace(SETTINGS, anthropic_api_key=None, claude_code_oauth_token="oat-token")
-        activities = SandboxActivities(settings, static_token("gh-token"), sandbox_cls=FakeSandbox)
+        activities = SandboxActivities(settings, tokens, sandbox_cls=FakeSandbox)
         await self.env.run(activities.create_sandbox, "issue-1")
         (call,) = FakeSandbox.create_calls
         self.assertEqual(call["envs"], {"CLAUDE_CODE_OAUTH_TOKEN": "oat-token"})
@@ -625,7 +697,7 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
             )
 
     def with_notifier(self, notifier: FakeNotifier) -> SandboxActivities:
-        return SandboxActivities(SETTINGS, static_token("gh-token"), sandbox_cls=FakeSandbox, usage_notifier=notifier)
+        return SandboxActivities(SETTINGS, tokens, sandbox_cls=FakeSandbox, usage_notifier=notifier)
 
     async def test_implement_plan_notifies_usage(self) -> None:
         notifier = FakeNotifier()
@@ -673,7 +745,7 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
         env = ActivityEnvironment()
         env.info = replace(env.info, workflow_id=workflow_id)
         activities = SandboxActivities(
-            SETTINGS, static_token("gh-token"), sandbox_cls=FakeSandbox, token_store=store, **kwargs
+            SETTINGS, tokens, sandbox_cls=FakeSandbox, token_store=store, **kwargs
         )
         return activities, env
 

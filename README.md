@@ -118,7 +118,8 @@ temporal operator namespace update --namespace default --retention 30d
 | `E2B_TEMPLATE` | worker | template do sandbox (default `claude`) |
 | `ANTHROPIC_API_KEY` | worker | auth do Claude Code via API (cobrança por token) |
 | `CLAUDE_CODE_OAUTH_TOKEN` | worker | alternativa: token da assinatura Claude (`claude setup-token`); defina só uma das duas |
-| `GITHUB_TOKEN` | worker | token fine-grained com acesso aos repos dos projetos, com **Contents: Read and write** e **Pull requests: Read and write** |
+| `GITHUB_APP_ID` | worker | id do GitHub App (ver "GitHub App") |
+| `GITHUB_APP_PRIVATE_KEY_PATH` | worker | caminho do arquivo `.pem` com a private key do GitHub App |
 | `LINEAR_API_KEY` | worker | personal API key do Linear, com escrita em issues (muda o status) |
 | `SMTP_HOST` | worker | opcional: servidor SMTP do aviso de uso (ex.: `smtp.gmail.com`); sem ele o aviso fica desligado |
 | `SMTP_PORT` | worker | porta SMTP com STARTTLS (default `587`) |
@@ -127,6 +128,20 @@ temporal operator namespace update --namespace default --retention 30d
 | `ALERT_EMAIL_TO` | worker | destinatário do aviso; obrigatória com `SMTP_HOST` |
 | `ALERT_TIMEZONE` | worker | fuso do horário do reset no email (default `America/Sao_Paulo`) |
 | `TOKEN_USAGE_DB` | worker | opcional: arquivo SQLite do uso de tokens (default `token_usage.db`); no WSL com o repo em `/mnt/c` ou OneDrive, prefira um caminho no lado Linux (ex.: `~/.local/share/software-factory/token_usage.db`): o lock do SQLite em drvfs não é confiável, a sincronização pode travar ou reverter o arquivo, e erro de escrita só vira warning no log |
+
+### GitHub App
+
+A fábrica acessa o GitHub como um GitHub App, não com um token pessoal.
+
+1. Crie o App na conta/org dos repos, **sem webhook**, com as permissões **Contents: Read and
+   write**, **Pull requests: Read and write** e **Metadata: Read**.
+2. Instale o App só nos repos da fábrica: a instalação é a lista de repos permitidos.
+3. Gere e baixe a private key (`.pem`) e preencha `GITHUB_APP_ID` e `GITHUB_APP_PRIVATE_KEY_PATH`.
+
+O worker gera, por issue, um token de instalação restrito ao repo dela (validade de 1h, renovado
+com 10 min de margem). Ao trocar o `GITHUB_TOKEN` por este App (ou ao mudar assinaturas de
+activities), faça o deploy do worker sem nenhum `plan-issue-*`, `implement-issue-*` ou
+`review-issue-*` rodando.
 
 ### Repo de cada projeto
 
@@ -143,7 +158,7 @@ está.
    test_command = "uv pip install --system -e \".[dev]\" && python -m pytest"
    ```
 
-3. O `GITHUB_TOKEN` precisa ter acesso a esse repo.
+3. O GitHub App precisa estar instalado nesse repo.
 
 Um anexo da issue que aponta para `https://github.com/<owner>/<repo>/tree/factory/<...>` (o "pin")
 vence o link do projeto; para trocar o repo de uma issue com pin, apague o anexo. Cada workflow

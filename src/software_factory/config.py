@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from software_factory.notify.email import EmailSettings
 
@@ -13,6 +14,13 @@ def _required(name: str) -> str:
     if not value:
         raise RuntimeError(f"{name} não definida")
     return value
+
+
+def _read_private_key(path: str) -> str:
+    try:
+        return Path(path).read_text()
+    except OSError as error:
+        raise RuntimeError(f"GITHUB_APP_PRIVATE_KEY_PATH ilegível: {error}") from error
 
 
 @dataclass(frozen=True)
@@ -40,7 +48,9 @@ class FactorySettings:
     """Configuração do worker: sandbox E2B, Claude Code, GitHub e Linear (o repo vem da issue)."""
 
     e2b_api_key: str
-    github_token: str
+    # GitHub App: id e conteúdo PEM da private key (lido de GITHUB_APP_PRIVATE_KEY_PATH).
+    github_app_id: str
+    github_app_private_key: str
     # Personal API key do Linear: muda o status da issue.
     linear_api_key: str
     # Auth do Claude Code no sandbox: exatamente uma das duas (API ou assinatura).
@@ -72,7 +82,8 @@ class FactorySettings:
             e2b_api_key=_required("E2B_API_KEY"),
             anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY") or None,
             claude_code_oauth_token=os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or None,
-            github_token=_required("GITHUB_TOKEN"),
+            github_app_id=_required("GITHUB_APP_ID"),
+            github_app_private_key=_read_private_key(_required("GITHUB_APP_PRIVATE_KEY_PATH")),
             linear_api_key=_required("LINEAR_API_KEY"),
             temporal_address=os.environ.get("TEMPORAL_ADDRESS", DEFAULT_TEMPORAL_ADDRESS),
             task_queue=os.environ.get("TASK_QUEUE", DEFAULT_TASK_QUEUE),

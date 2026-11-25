@@ -7,7 +7,6 @@ from typing import Any
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
-from software_factory.github.client import static_token
 from software_factory.orchestration.activities import (
     IMPLEMENT_COMMAND_TIMEOUT_S,
     REPO_DIR,
@@ -61,10 +60,15 @@ FINDING = {
 REVIEW_JSON = json.dumps({"summary": "Uma correção.", "findings": [FINDING]})
 
 
+
+async def tokens(repo: str) -> str:
+    return "gh-token"
+
+
 class TestReviewActivities(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         FakeSandbox.reset()
-        sandbox = SandboxActivities(SETTINGS, static_token("gh-token"), sandbox_cls=FakeSandbox)
+        sandbox = SandboxActivities(SETTINGS, tokens, sandbox_cls=FakeSandbox)
         self.activities = ReviewActivities(sandbox)
         self.env = ActivityEnvironment()
         self.heartbeats: list[Any] = []
@@ -107,7 +111,7 @@ class TestReviewActivities(unittest.IsolatedAsyncioTestCase):
 
     async def test_review_pull_notifies_usage(self) -> None:
         notifier = FakeNotifier()
-        sandbox = SandboxActivities(SETTINGS, static_token("gh-token"), sandbox_cls=FakeSandbox, usage_notifier=notifier)
+        sandbox = SandboxActivities(SETTINGS, tokens, sandbox_cls=FakeSandbox, usage_notifier=notifier)
         activities = ReviewActivities(sandbox)
         self.claude_reviews()
         FakeSandbox.instance.commands.stdout = stream(

@@ -115,15 +115,6 @@ GitHubClients = Callable[[str], Awaitable[GitHubClient]]
 TokenProvider = Callable[[str], Awaitable[str]]
 
 
-def static_token(token: str) -> TokenProvider:
-    """Provider que devolve o mesmo token (o PAT) para qualquer repo."""
-
-    async def provide(repo: str) -> str:
-        return token
-
-    return provide
-
-
 def github_clients(tokens: TokenProvider) -> GitHubClients:
     """Monta `GitHubClients`: um `GitHubClient` por repo, com o token de `tokens(repo)`."""
 
