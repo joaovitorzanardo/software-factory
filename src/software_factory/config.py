@@ -50,7 +50,7 @@ class FactorySettings:
     e2b_api_key: str
     # GitHub App: id e conteúdo PEM da private key (lido de GITHUB_APP_PRIVATE_KEY_PATH).
     github_app_id: str
-    github_app_private_key: str
+    github_app_private_key: str = field(repr=False)
     # Personal API key do Linear: muda o status da issue.
     linear_api_key: str
     # Auth do Claude Code no sandbox: exatamente uma das duas (API ou assinatura).

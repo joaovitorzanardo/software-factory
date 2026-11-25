@@ -83,7 +83,7 @@ src/software_factory/
                       # CommitImplementationRequest, PullRequestRequest, ImplementResult e, do loop de correção,
                       # FixAttempt, Clarification, AnalyzeRequest, FixAnalysis, FixRequest, CommentRequest,
                       # HumanAnswer, UsageAlert, UsageReportRequest, do repo por issue RepoTarget,
-                      # RepoResolution, CloneRepoRequest, RunTestsRequest, BranchRequest), STATE_* e OUTCOME_*
+                      # RepoResolution, CloneRepoRequest, RunTestsRequest, BranchRequest, AttachLinkRequest), STATE_* e OUTCOME_*
     activities.py     # SandboxActivities: create_sandbox, clone_repo, generate_plan, commit_plan,
                       # clone_branch, implement_plan, analyze_failure, implement_fix, run_tests,
                       # commit_implementation, kill_sandbox; install_skills (copia orchestration/skills/);
@@ -97,7 +97,7 @@ src/software_factory/
     token_activities.py   # TokenUsageActivities.token_usage_report (lê o SQLite e devolve o texto do comentário, `render_usage_comment`)
     token_reporting.py    # publish_token_usage: helper dos workflows (report → upsert_comment; falha só loga)
     linear_activities.py  # LinearActivities: move_issue (muda o status por nome, no time da issue),
-                          # post_comment, upsert_comment (cria ou edita pelo id) e create_issue (idempotentes,
+                          # post_comment, upsert_comment (cria ou edita pelo id), attach_link (anexa a URL à issue, sem duplicar) e create_issue (idempotentes,
                           # com UUID gerado pelo cliente)
     review_activities.py  # ReviewActivities(sandbox): review_pull (duas lentes + triagem), implement_review_fix
     review_prompts.py     # prompts da review, parse_review, REVIEW_DIR, FINDING_DETAIL_CAP,

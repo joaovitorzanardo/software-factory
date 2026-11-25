@@ -17,7 +17,7 @@ ISSUE_REPO_QUERY = """
 query($id: String!) {
   issue(id: $id) {
     project { name externalLinks { nodes { url } } }
-    attachments { nodes { url } }
+    attachments(first: 100) { nodes { url } }
   }
 }
 """

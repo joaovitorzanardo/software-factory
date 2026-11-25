@@ -165,7 +165,9 @@ vence o link do projeto; para trocar o repo de uma issue com pin, apague o anexo
 resolve o repo uma vez, no início (o planejamento antes de mover a issue para `In Planning`; a
 implementação e a review logo depois de conferir o status). Se não der para resolver (issue sem
 projeto, projeto sem link ou com mais de um repo, repo sem acesso ou sem `.factory.toml` válido), o
-workflow comenta o motivo na issue e falha; corrija e dispare a etapa de novo. O `.factory.toml` é
+workflow comenta o motivo na issue e falha. Corrija o link ou o `.factory.toml` e dispare a etapa
+de novo: no planejamento, remova e adicione de novo a label `Feature`/`Bug`; na implementação e na
+review, tire a issue do status (`In Progress` / `In Review`) e volte para ele. O `.factory.toml` é
 um arquivo sensível na review: PR que o muda só é mergeada com confirmação de uma pessoa.
 
 ### Aviso de uso da sessão do Claude
@@ -289,10 +291,10 @@ parar, mova a issue para fora de `In Review`.
 Requisitos e ressalvas da review:
 
 - O time do Linear precisa do status `Done`.
-- O token do GitHub precisa poder fazer merge: **Contents** e **Pull requests: Read and write**,
-  que já são necessários.
-- Branch protection que exige aprovação **bloqueia o merge**, porque o autor da PR é o dono do
-  token. Nesse caso o workflow pergunta; aprove ou ajuste a regra.
+- O GitHub App precisa poder fazer merge: **Contents** e **Pull requests: Read and write**
+  (mais **Metadata: Read**), que já são necessários.
+- Branch protection que exige aprovação **bloqueia o merge**: o autor da PR é o bot do GitHub App
+  e a regra continua valendo para ele. Nesse caso o workflow pergunta; aprove ou ajuste a regra.
 - Sugestão: ative "Automatically delete head branches" no repo alvo, já que a fábrica não apaga
   `factory/<IDENTIFIER>`.
 - Ainda não validado em sandbox E2B real: os dois processos `claude` das lentes rodam ao mesmo

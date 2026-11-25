@@ -249,6 +249,8 @@ class TestFactorySettings(unittest.TestCase):
             settings = FactorySettings.from_env()
         self.assertEqual(settings.github_app_id, "123")
         self.assertTrue(settings.github_app_private_key.startswith("-----BEGIN"))
+        self.assertNotIn(settings.github_app_private_key, repr(settings))
+        self.assertNotIn("BEGIN", repr(settings))
 
     def test_from_env_requires_app_id(self) -> None:
         env = {
