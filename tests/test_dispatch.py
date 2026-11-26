@@ -3,14 +3,17 @@ import unittest
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
 from software_factory.orchestration.dispatch import (
+    ISSUE_WORKFLOWS,
     KIND_IMPLEMENT,
     KIND_PLAN,
     KIND_REVIEW,
+    issue_workflow_id,
     start_issue_workflow,
 )
 from software_factory.orchestration.implement_workflow import ImplementIssueWorkflow
 from software_factory.orchestration.models import PlanIssueInput
 from software_factory.orchestration.review_workflow import ReviewIssueWorkflow
+from software_factory.orchestration.token_usage import stage_for_workflow
 from software_factory.orchestration.workflow import PlanIssueWorkflow
 
 ISSUE = PlanIssueInput(
@@ -54,3 +57,10 @@ class TestStartIssueWorkflow(unittest.IsolatedAsyncioTestCase):
         client = FakeClient(RuntimeError("temporal fora"))
         with self.assertRaises(RuntimeError):
             await start_issue_workflow(client, "q", KIND_PLAN, ISSUE)
+
+
+class TestTokenStagePrefixes(unittest.TestCase):
+    def test_token_stage_prefixes_match_workflows(self) -> None:
+        for kind in ISSUE_WORKFLOWS:
+            with self.subTest(kind=kind):
+                self.assertEqual(stage_for_workflow(issue_workflow_id(kind, "x")), (kind, "x"))

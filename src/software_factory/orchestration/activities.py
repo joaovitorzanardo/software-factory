@@ -1,6 +1,8 @@
 import asyncio
 import json
 import re
+import uuid
+from datetime import UTC, datetime
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -10,11 +12,15 @@ from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
 from software_factory.config import FactorySettings
+from software_factory.github.client import TokenProvider
 from software_factory.orchestration.notify_activities import UsageAlertNotifier
+from software_factory.orchestration.token_store import SessionRecord, TokenStore
+from software_factory.orchestration.token_usage import TokenMeter, stage_for_workflow
 from software_factory.orchestration.usage import UsageWatcher
 from software_factory.orchestration.models import (
     AnalyzeRequest,
     CloneBranchRequest,
+    CloneRepoRequest,
     Clarification,
     CommitImplementationRequest,
     CommitPlanRequest,
@@ -23,6 +29,7 @@ from software_factory.orchestration.models import (
     ImplementRequest,
     PlanIssueInput,
     PlanRequest,
+    RunTestsRequest,
     TestRunResult,
 )
 
@@ -130,7 +137,7 @@ URL: {issue.url or "-"}
 
 _NO_TEST_TAMPERING = (
     "Proibido apagar, pular ou afrouxar testes (nada de `skip`, `xfail`, remover asserts) "
-    "e proibido mudar o `TEST_COMMAND`: a correção tem de estar no código, não nos testes."
+    "e proibido mudar o `.factory.toml`: a correção tem de estar no código, não nos testes."
 )
 
 
@@ -281,24 +288,33 @@ class SandboxActivities:
     def __init__(
         self,
         settings: FactorySettings,
+        tokens: TokenProvider,
         sandbox_cls: Any = AsyncSandbox,
         usage_notifier: UsageAlertNotifier | None = None,
+        token_store: TokenStore | None = None,
     ) -> None:
         self.settings = settings
+        self.tokens = tokens
         self.sandbox_cls = sandbox_cls
         self.usage_notifier = usage_notifier
+        self.token_store = token_store
 
     async def _run_claude(self, sandbox: Any, cmd: str, timeout: int) -> Any:
-        """Roda uma sessão do Claude e avisa quando o uso da sessão passa do limiar."""
+        """Roda uma sessão do Claude, avisa quando o uso da sessão passa do limiar e grava os tokens."""
         notifier = self.usage_notifier
-        if notifier is None:
-            return await _run_with_heartbeat(sandbox, cmd, timeout)
         info = activity.info()
-        watcher = UsageWatcher(f"{info.workflow_id}/{info.activity_type}")
+        watcher = UsageWatcher(f"{info.workflow_id}/{info.activity_type}") if notifier else None
+        meter = TokenMeter()
         tasks: set[asyncio.Task[bool]] = set()
 
         def on_line(chunk: str) -> None:
             # Exceção aqui faria o E2B parar de ler o stdout e falhar a sessão.
+            try:
+                meter.feed(chunk)
+            except Exception:
+                activity.logger.warning("falha ao contar os tokens da sessão", exc_info=True)
+            if watcher is None or notifier is None:
+                return
             try:
                 for alert in watcher.feed(chunk):
                     tasks.add(asyncio.create_task(notifier.notify(alert)))
@@ -308,6 +324,7 @@ class SandboxActivities:
         try:
             return await _run_with_heartbeat(sandbox, cmd, timeout, on_line=on_line)
         finally:
+            await self._record_session(meter, info)
             if tasks:
                 # O aviso nunca derruba a sessão: erros e demora ficam só no log.
                 done, pending = await asyncio.wait(tasks, timeout=NOTIFY_WAIT_S)
@@ -318,6 +335,28 @@ class SandboxActivities:
                         activity.logger.warning(
                             "aviso de uso falhou: %r", task.exception()
                         )
+
+    async def _record_session(self, meter: TokenMeter, info: Any) -> None:
+        """Grava o uso da sessão; nunca levanta (timeout e erro da sessão também gravam)."""
+        try:
+            stage = stage_for_workflow(info.workflow_id)
+            usage = meter.usage()
+            if self.token_store is None or stage is None or usage is None:
+                return
+            record = SessionRecord(
+                key=uuid.uuid4().hex,
+                issue_id=stage[1],
+                stage=stage[0],
+                workflow_id=info.workflow_id,
+                run_id=info.workflow_run_id,
+                activity=info.activity_type,
+                attempt=info.attempt,
+                recorded_at=datetime.now(UTC).isoformat(),
+                usage=usage,
+            )
+            await asyncio.to_thread(self.token_store.record, record)
+        except Exception:
+            activity.logger.warning("falha ao gravar o uso de tokens da sessão", exc_info=True)
 
     async def _connect(self, sandbox_id: str) -> Any:
         return await self.sandbox_cls.connect(sandbox_id, api_key=self.settings.e2b_api_key)
@@ -341,16 +380,20 @@ class SandboxActivities:
         return sandbox.sandbox_id
 
     @activity.defn
-    async def clone_repo(self, sandbox_id: str) -> None:
-        sandbox = await self._connect(sandbox_id)
-        if await sandbox.files.exists(f"{REPO_DIR}/.git"):
-            return
+    async def clone_repo(self, request: CloneRepoRequest) -> None:
+        repo = request.target.repo
+        sandbox = await self._connect(request.sandbox_id)
+        if not await sandbox.files.exists(f"{REPO_DIR}/.git"):
+            await sandbox.commands.run(
+                f"git clone --depth 1 {self._authed_url(repo)} {REPO_DIR}",
+                envs=await self._token_env(repo),
+                timeout=5 * 60,
+            )
+        # Também em retry: o Claude roda com Bash e não pode achar o token em .git/config.
         await sandbox.commands.run(
-            "git clone --depth 1 "
-            f'"https://x-access-token:$GITHUB_TOKEN@github.com/{self.settings.target_repo}.git" '
-            f"{REPO_DIR}",
-            envs={"GITHUB_TOKEN": self.settings.github_token},
-            timeout=5 * 60,
+            f"git remote set-url origin https://github.com/{repo}.git",
+            cwd=REPO_DIR,
+            timeout=GIT_COMMAND_TIMEOUT_S,
         )
 
     @activity.defn
@@ -376,15 +419,20 @@ class SandboxActivities:
     async def commit_plan(self, request: CommitPlanRequest) -> str:
         path = plan_path(request.identifier)
         branch = plan_branch(request.identifier)
+        repo = request.target.repo
         sandbox = await self._connect(request.sandbox_id)
         if not await sandbox.files.exists(f"{REPO_DIR}/{path}"):
             raise ApplicationError(f"plano não encontrado em {path}")
+        token_env = await self._token_env(repo)
+        url = self._authed_url(repo)
 
-        async def git(cmd: str) -> str:
-            result = await sandbox.commands.run(cmd, cwd=REPO_DIR, timeout=GIT_COMMAND_TIMEOUT_S)
+        async def git(cmd: str, **kwargs: Any) -> str:
+            result = await sandbox.commands.run(
+                cmd, cwd=REPO_DIR, timeout=GIT_COMMAND_TIMEOUT_S, **kwargs
+            )
             return result.stdout.strip()
 
-        # O token já está na URL do origin gravada pelo clone_repo; não vai no comando.
+        # O origin não guarda token: ls-remote e push usam a URL autenticada (token em envs=).
         await git(f"git checkout -B {branch}")
         await git(f"git add {path}")
         await git(
@@ -393,7 +441,7 @@ class SandboxActivities:
             f' commit -m "docs: plano de implementação {request.identifier}"'
         )
         local_sha = await git("git rev-parse HEAD")
-        remote = await git(f"git ls-remote --heads origin refs/heads/{branch}")
+        remote = await git(f"git ls-remote --heads {url} refs/heads/{branch}", envs=token_env)
         remote_sha = remote.split()[0] if remote else ""
         if remote_sha == local_sha:
             return branch  # retry depois de um push que já aconteceu
@@ -401,25 +449,30 @@ class SandboxActivities:
             raise ApplicationError(
                 f"branch {branch} já existe no remoto com outro conteúdo", non_retryable=True
             )
-        await git(f"{GIT_NO_HOOKS} push -u origin {branch}")
+        await git(f"{GIT_NO_HOOKS} push {url} HEAD:refs/heads/{branch}", envs=token_env)
         return branch
 
-    def _authed_url(self) -> str:
+    @staticmethod
+    def _authed_url(repo: str) -> str:
         # $GITHUB_TOKEN é expandido pelo shell a partir de envs=; o token nunca vai no comando.
-        return f'"https://x-access-token:$GITHUB_TOKEN@github.com/{self.settings.target_repo}.git"'
+        return f'"https://x-access-token:$GITHUB_TOKEN@github.com/{repo}.git"'
+
+    async def _token_env(self, repo: str) -> dict[str, str]:
+        return {"GITHUB_TOKEN": await self.tokens(repo)}
 
     @activity.defn
     async def clone_branch(self, request: CloneBranchRequest) -> str:
         """Clona factory/<ID> sem deixar o token no origin; retorna o SHA clonado."""
         branch = plan_branch(request.identifier)
+        repo = request.target.repo
         sandbox = await self._connect(request.sandbox_id)
         if not await sandbox.files.exists(f"{REPO_DIR}/.git"):
             # Histórico recente para a análise ver o que mudou (sem token no origin, não dá
             # para aprofundar depois).
             await sandbox.commands.run(
                 f"git clone --depth {CLONE_BRANCH_DEPTH} --branch {branch}"
-                f" {self._authed_url()} {REPO_DIR}",
-                envs={"GITHUB_TOKEN": self.settings.github_token},
+                f" {self._authed_url(repo)} {REPO_DIR}",
+                envs=await self._token_env(repo),
                 timeout=5 * 60,
             )
 
@@ -428,7 +481,7 @@ class SandboxActivities:
             return result.stdout.strip()
 
         # Também em retry: o Claude roda com Bash e não pode achar o token em .git/config.
-        await git(f"git remote set-url origin https://github.com/{self.settings.target_repo}.git")
+        await git(f"git remote set-url origin https://github.com/{repo}.git")
         await git(f'git config user.name "{GIT_AUTHOR_NAME}"')
         await git(f'git config user.email "{GIT_AUTHOR_EMAIL}"')
         return await git(f"git rev-parse refs/remotes/origin/{branch}")
@@ -438,7 +491,7 @@ class SandboxActivities:
         sandbox = await self._connect(request.sandbox_id)
         await sandbox.files.write(
             IMPLEMENT_PROMPT_PATH,
-            build_implement_prompt(request.issue, self.settings.test_command),
+            build_implement_prompt(request.issue, request.target.test_command),
         )
         result = await self._run_claude(
             sandbox, implement_command(), IMPLEMENT_COMMAND_TIMEOUT_S
@@ -455,7 +508,7 @@ class SandboxActivities:
             f"rm -rf {FIX_DIR} && mkdir -p {FIX_DIR}", timeout=GIT_COMMAND_TIMEOUT_S
         )
         await sandbox.files.write(
-            ANALYZE_PROMPT_PATH, build_analyze_prompt(request, self.settings.test_command)
+            ANALYZE_PROMPT_PATH, build_analyze_prompt(request, request.target.test_command)
         )
         result = await self._run_claude(sandbox, analyze_command(), ANALYZE_COMMAND_TIMEOUT_S)
         parse_result(result.stdout)
@@ -484,18 +537,18 @@ class SandboxActivities:
         await sandbox.files.write(ANALYSIS_PATH, request.analysis)
         await sandbox.files.write(FIX_PLAN_PATH, request.plan)
         await sandbox.files.write(
-            FIX_PROMPT_PATH, build_fix_prompt(request, self.settings.test_command)
+            FIX_PROMPT_PATH, build_fix_prompt(request, request.target.test_command)
         )
         result = await self._run_claude(sandbox, fix_command(), IMPLEMENT_COMMAND_TIMEOUT_S)
         return parse_result(result.stdout)
 
     @activity.defn
-    async def run_tests(self, sandbox_id: str) -> TestRunResult:
-        """Roda TEST_COMMAND no repo; o orquestrador não confia no relato do Claude."""
-        sandbox = await self._connect(sandbox_id)
+    async def run_tests(self, request: RunTestsRequest) -> TestRunResult:
+        """Roda o comando de testes do repo; o orquestrador não confia no relato do Claude."""
+        sandbox = await self._connect(request.sandbox_id)
         try:
             result = await _run_with_heartbeat(
-                sandbox, self.settings.test_command, TEST_COMMAND_TIMEOUT_S
+                sandbox, request.target.test_command, TEST_COMMAND_TIMEOUT_S
             )
         except CommandExitException as error:
             output = (error.stdout or "") + (error.stderr or "")
@@ -505,7 +558,8 @@ class SandboxActivities:
             return TestRunResult(
                 passed=False,
                 output=(
-                    f"TEST_COMMAND estourou o timeout de {TEST_COMMAND_TIMEOUT_S // 60} min"
+                    "o comando de testes estourou o timeout de"
+                    f" {TEST_COMMAND_TIMEOUT_S // 60} min"
                     f" ({error}); algum teste travou ou ficou lento demais."
                 ),
             )
@@ -516,7 +570,9 @@ class SandboxActivities:
     async def commit_implementation(self, request: CommitImplementationRequest) -> str:
         branch = plan_branch(request.identifier)
         sandbox = await self._connect(request.sandbox_id)
-        token_env = {"GITHUB_TOKEN": self.settings.github_token}
+        repo = request.target.repo
+        token_env = await self._token_env(repo)
+        url = self._authed_url(repo)
 
         async def git(cmd: str, **kwargs: Any) -> str:
             result = await sandbox.commands.run(
@@ -533,7 +589,7 @@ class SandboxActivities:
                 raise ApplicationError("Claude Code não fez mudanças", non_retryable=True)
             return branch
         remote = await git(
-            f"git ls-remote --heads {self._authed_url()} refs/heads/{branch}", envs=token_env
+            f"git ls-remote --heads {url} refs/heads/{branch}", envs=token_env
         )
         remote_sha = remote.split()[0] if remote else ""
         if remote_sha == local_sha:
@@ -543,7 +599,7 @@ class SandboxActivities:
                 f"branch {branch} mudou no remoto desde o clone", non_retryable=True
             )
         await git(
-            f"{GIT_NO_HOOKS} push {self._authed_url()} HEAD:refs/heads/{branch}", envs=token_env
+            f"{GIT_NO_HOOKS} push {url} HEAD:refs/heads/{branch}", envs=token_env
         )
         return branch
 

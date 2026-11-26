@@ -1,3 +1,4 @@
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
@@ -107,3 +108,17 @@ class GitHubClient:
             json={"title": title, "head": head, "base": base, "body": body},
         )
         return response.json()["html_url"]
+
+# repo (`owner/repo`) -> cliente autenticado para ele
+GitHubClients = Callable[[str], Awaitable[GitHubClient]]
+# repo (`owner/repo`) -> token de acesso a esse repo.
+TokenProvider = Callable[[str], Awaitable[str]]
+
+
+def github_clients(tokens: TokenProvider) -> GitHubClients:
+    """Monta `GitHubClients`: um `GitHubClient` por repo, com o token de `tokens(repo)`."""
+
+    async def build(repo: str) -> GitHubClient:
+        return GitHubClient(await tokens(repo), repo)
+
+    return build

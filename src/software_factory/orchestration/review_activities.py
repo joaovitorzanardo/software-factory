@@ -77,10 +77,11 @@ class ReviewActivities:
             f"rm -rf {REVIEW_DIR} && mkdir -p {REVIEW_DIR}", timeout=GIT_COMMAND_TIMEOUT_S
         )
         # Clone raso: o merge-base precisa estar local para o `git diff <base>..HEAD`.
+        repo = request.target.repo
         await sandbox.commands.run(
-            f"git fetch --depth 1 {self.sandbox._authed_url()} {request.base_sha}",
+            f"git fetch --depth 1 {self.sandbox._authed_url(repo)} {request.base_sha}",
             cwd=REPO_DIR,
-            envs={"GITHUB_TOKEN": self.sandbox.settings.github_token},
+            envs=await self.sandbox._token_env(repo),
             timeout=GIT_COMMAND_TIMEOUT_S,
         )
         # Portão do orquestrador, antes de qualquer Claude: o código revisado não o controla.
@@ -131,7 +132,7 @@ class ReviewActivities:
         await install_skills(sandbox)
         await sandbox.files.write(
             REVIEW_FIX_PROMPT_PATH,
-            build_review_fix_prompt(request, self.sandbox.settings.test_command),
+            build_review_fix_prompt(request, request.target.test_command),
         )
         result = await self.sandbox._run_claude(
             sandbox, review_fix_command(), IMPLEMENT_COMMAND_TIMEOUT_S

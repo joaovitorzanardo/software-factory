@@ -12,6 +12,7 @@ with workflow.unsafe.imports_passed_through():
         OUTCOME_STOPPED,
         STATE_DONE,
         STATE_IN_REVIEW,
+        BranchRequest,
         CommentRequest,
         CreateIssueRequest,
         FollowUpIssue,
@@ -29,6 +30,8 @@ with workflow.unsafe.imports_passed_through():
         ReviewRound,
         TestRunResult,
     )
+    from software_factory.orchestration.repo_resolution import resolve_target
+    from software_factory.orchestration.token_reporting import publish_token_usage
     from software_factory.orchestration.sessions import SessionWorkflow, failure_message
 
 # Rodadas seguidas sem merge antes de perguntar no Linear: correção da review, review que falhou,
@@ -157,6 +160,7 @@ class ReviewIssueWorkflow(SessionWorkflow):
         if not still_in_review:
             workflow.logger.info("%s saiu de %s; não revisa", issue.identifier, STATE_IN_REVIEW)
             return ReviewResult(issue.identifier, OUTCOME_SKIPPED)
+        self._target = await resolve_target(issue)
 
         rounds: list[ReviewRound] = []
         # Rodadas que não terminaram em merge (ver MAX_REVIEW_ROUNDS); a resposta à pergunta de
@@ -169,34 +173,35 @@ class ReviewIssueWorkflow(SessionWorkflow):
         confirmed_shas: list[str] = []
         while True:
             if not await self._still_in(issue, STATE_IN_REVIEW):
-                return self._stopped(issue, follow_ups)
+                return await self._stopped(issue, follow_ups)
             pull: PullInfo | None = await workflow.execute_activity(
                 "pull_request_info",
-                issue.identifier,
+                BranchRequest(issue.identifier, self.target),
                 start_to_close_timeout=QUICK_CALL_TIMEOUT,
                 retry_policy=QUICK_CALL_RETRY,
                 result_type=PullInfo,
             )
             if pull is None:
                 workflow.logger.info("%s sem PR aberta", issue.identifier)
+                await publish_token_usage(issue.issue_id)
                 return ReviewResult(issue.identifier, OUTCOME_NO_PR, follow_ups=tuple(follow_ups))
             if fix_rounds >= MAX_REVIEW_ROUNDS:
                 question = review_stuck_question(fix_rounds, rounds[-1])
                 label = REVIEW_STUCK_QUESTION.format(n=fix_rounds)
                 if not await self._ask(issue, question, STATE_IN_REVIEW, label=label):
-                    return self._stopped(issue, follow_ups)
+                    return await self._stopped(issue, follow_ups)
                 fix_rounds = 0
 
             number = len(rounds) + 1
             reviewed = await self._review_session(issue, pull, rounds)
             if isinstance(reviewed, TestRunResult):
                 # Head vermelho (checkpoint wip, push humano...): corrige antes de revisar; a
-                # review e o merge só acontecem sobre um sha com TEST_COMMAND verde.
+                # review e o merge só acontecem sobre um sha com os testes verdes.
                 rounds.append(ReviewRound(number, RED_BEFORE_REVIEW))
                 fix_rounds += 1
                 green = await self._fix_until_green(issue, reviewed, STATE_IN_REVIEW)
                 if green is None:
-                    return self._stopped(issue, follow_ups)
+                    return await self._stopped(issue, follow_ups)
                 continue
             if isinstance(reviewed, str):
                 # Sessão de review falhou: conta rodada (trava de custo) e revisa de novo.
@@ -227,7 +232,7 @@ class ReviewIssueWorkflow(SessionWorkflow):
             if asks:
                 label = f"Review {number}: " + "; ".join(f.title for f in asks)
                 if not await self._ask(issue, asks_question(asks), STATE_IN_REVIEW, label=label):
-                    return self._stopped(issue, follow_ups)
+                    return await self._stopped(issue, follow_ups)
                 # Não corrige antes da resposta: a próxima review já a leva em conta.
                 rounds.append(review_round)
                 continue
@@ -236,7 +241,7 @@ class ReviewIssueWorkflow(SessionWorkflow):
                 if not tests.passed:
                     green = await self._fix_until_green(issue, tests, STATE_IN_REVIEW)
                     if green is None:
-                        return self._stopped(issue, follow_ups)
+                        return await self._stopped(issue, follow_ups)
                 rounds.append(
                     ReviewRound(number, report.summary, report.findings, fix_notes=notes)
                 )
@@ -251,12 +256,14 @@ class ReviewIssueWorkflow(SessionWorkflow):
                 )
                 question = sensitive_files_question(pull, reviewed_sha, report.sensitive_files)
                 if not await self._ask(issue, question, STATE_IN_REVIEW, label=label):
-                    return self._stopped(issue, follow_ups)
+                    return await self._stopped(issue, follow_ups)
                 # A resposta confirma o merge deste sha; para parar, a pessoa move a issue.
                 confirmed_shas.append(reviewed_sha)
             merge: MergeResult = await workflow.execute_activity(
                 "merge_pull_request",
-                MergeRequest(issue.identifier, issue.title, pull.number, reviewed_sha),
+                MergeRequest(
+                    issue.identifier, issue.title, pull.number, reviewed_sha, self.target
+                ),
                 start_to_close_timeout=QUICK_CALL_TIMEOUT,
                 retry_policy=MERGE_RETRY,
                 result_type=MergeResult,
@@ -267,6 +274,7 @@ class ReviewIssueWorkflow(SessionWorkflow):
                         issue.issue_id, to_state=STATE_DONE, from_state=STATE_IN_REVIEW
                     )
                 )
+                await publish_token_usage(issue.issue_id, final=True)
                 return ReviewResult(
                     issue.identifier, OUTCOME_MERGED, pull.url, tuple(follow_ups)
                 )
@@ -282,10 +290,11 @@ class ReviewIssueWorkflow(SessionWorkflow):
             )
             label = f"Merge bloqueado: {merge.reason}"
             if not await self._ask(issue, question, STATE_IN_REVIEW, label=label):
-                return self._stopped(issue, follow_ups)
+                return await self._stopped(issue, follow_ups)
 
-    def _stopped(self, issue: PlanIssueInput, follow_ups: list[str]) -> ReviewResult:
+    async def _stopped(self, issue: PlanIssueInput, follow_ups: list[str]) -> ReviewResult:
         workflow.logger.info("%s saiu de %s; para a review", issue.identifier, STATE_IN_REVIEW)
+        await publish_token_usage(issue.issue_id)
         return ReviewResult(issue.identifier, OUTCOME_STOPPED, follow_ups=tuple(follow_ups))
 
     async def _create_follow_ups(
@@ -319,20 +328,13 @@ class ReviewIssueWorkflow(SessionWorkflow):
     async def _review_session(
         self, issue: PlanIssueInput, pull: PullInfo, rounds: list[ReviewRound]
     ) -> tuple[ReviewReport, str] | str | TestRunResult:
-        """Roda TEST_COMMAND no head clonado e, se verde, faz a review da PR; devolve o relatório
+        """Roda os testes no head clonado e, se verde, faz a review da PR; devolve o relatório
         e o sha revisado, o TestRunResult vermelho (sem review) ou a mensagem de falha da sessão
         do Claude. Falhas de sandbox/clone/testes ainda falham o workflow."""
         sandbox_id = await self._create_sandbox(issue)
         try:
             reviewed_sha = await self._clone_branch(sandbox_id, issue)
-            tests: TestRunResult = await workflow.execute_activity(
-                "run_tests",
-                sandbox_id,
-                start_to_close_timeout=timedelta(minutes=12),
-                heartbeat_timeout=timedelta(minutes=2),
-                retry_policy=RetryPolicy(maximum_attempts=1),
-                result_type=TestRunResult,
-            )
+            tests = await self._run_tests(sandbox_id)
             if not tests.passed:
                 return tests
             try:
@@ -342,6 +344,7 @@ class ReviewIssueWorkflow(SessionWorkflow):
                         sandbox_id=sandbox_id,
                         issue=issue,
                         base_sha=pull.base_sha,
+                        target=self.target,
                         history=tuple(rounds),
                         clarifications=tuple(self._clarifications),
                     ),
@@ -372,6 +375,7 @@ class ReviewIssueWorkflow(SessionWorkflow):
                         issue=issue,
                         round=round,
                         findings=tuple(findings),
+                        target=self.target,
                         clarifications=tuple(self._clarifications),
                     ),
                     start_to_close_timeout=timedelta(minutes=35),
@@ -396,14 +400,7 @@ class ReviewIssueWorkflow(SessionWorkflow):
                         failure_message(commit_error),
                     )
                 return TestRunResult(passed=False, output=message), message
-            tests: TestRunResult = await workflow.execute_activity(
-                "run_tests",
-                sandbox_id,
-                start_to_close_timeout=timedelta(minutes=12),
-                heartbeat_timeout=timedelta(minutes=2),
-                retry_policy=RetryPolicy(maximum_attempts=1),
-                result_type=TestRunResult,
-            )
+            tests = await self._run_tests(sandbox_id)
             if tests.passed:
                 message = f"fix: review {round} de {issue.identifier}"
             else:

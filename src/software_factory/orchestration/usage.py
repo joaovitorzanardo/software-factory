@@ -15,8 +15,8 @@ def _number(value: Any) -> bool:
     return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
 
 
-def session_usage(event: dict[str, Any]) -> UsageAlert | None:
-    """O alerta se o evento mostra a janela de sessão em ou acima do limiar; senão None."""
+def five_hour_window(event: dict[str, Any]) -> tuple[float, int] | None:
+    """`(utilization, resets_at)` da janela de sessão num `rate_limit_event`; None se faltar ou for inválido."""
     if event.get("type") != "rate_limit_event":
         return None
     info = event.get("rate_limit_info")
@@ -35,9 +35,15 @@ def session_usage(event: dict[str, Any]) -> UsageAlert | None:
     utilization, resets_at = window.get("utilization"), window.get("resetsAt")
     if not _number(utilization) or not _number(resets_at):
         return None
-    if utilization < SESSION_ALERT_THRESHOLD:
+    return utilization, int(resets_at)
+
+
+def session_usage(event: dict[str, Any]) -> UsageAlert | None:
+    """O alerta se o evento mostra a janela de sessão em ou acima do limiar; senão None."""
+    window = five_hour_window(event)
+    if window is None or window[0] < SESSION_ALERT_THRESHOLD:
         return None
-    return UsageAlert(window=SESSION_WINDOW, utilization=utilization, resets_at=int(resets_at))
+    return UsageAlert(window=SESSION_WINDOW, utilization=window[0], resets_at=window[1])
 
 
 def usage_alert_workflow_id(alert: UsageAlert) -> str:

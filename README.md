@@ -118,9 +118,8 @@ temporal operator namespace update --namespace default --retention 30d
 | `E2B_TEMPLATE` | worker | template do sandbox (default `claude`) |
 | `ANTHROPIC_API_KEY` | worker | auth do Claude Code via API (cobrança por token) |
 | `CLAUDE_CODE_OAUTH_TOKEN` | worker | alternativa: token da assinatura Claude (`claude setup-token`); defina só uma das duas |
-| `GITHUB_TOKEN` | worker | token fine-grained restrito ao repo alvo, com **Contents: Read and write** e **Pull requests: Read and write** |
-| `TARGET_REPO` | worker | repo que a fábrica opera (`owner/repo`) |
-| `TEST_COMMAND` | worker | comando que roda os testes do repo alvo no sandbox (exit 0 = verde), ex.: `uv pip install --system -e ".[dev]" && python -m pytest` |
+| `GITHUB_APP_ID` | worker | id do GitHub App (ver "GitHub App") |
+| `GITHUB_APP_PRIVATE_KEY_PATH` | worker | caminho do arquivo `.pem` com a private key do GitHub App |
 | `LINEAR_API_KEY` | worker | personal API key do Linear, com escrita em issues (muda o status) |
 | `SMTP_HOST` | worker | opcional: servidor SMTP do aviso de uso (ex.: `smtp.gmail.com`); sem ele o aviso fica desligado |
 | `SMTP_PORT` | worker | porta SMTP com STARTTLS (default `587`) |
@@ -128,6 +127,48 @@ temporal operator namespace update --namespace default --retention 30d
 | `ALERT_EMAIL_FROM` | worker | remetente do aviso (default `SMTP_USERNAME`) |
 | `ALERT_EMAIL_TO` | worker | destinatário do aviso; obrigatória com `SMTP_HOST` |
 | `ALERT_TIMEZONE` | worker | fuso do horário do reset no email (default `America/Sao_Paulo`) |
+| `TOKEN_USAGE_DB` | worker | opcional: arquivo SQLite do uso de tokens (default `token_usage.db`); no WSL com o repo em `/mnt/c` ou OneDrive, prefira um caminho no lado Linux (ex.: `~/.local/share/software-factory/token_usage.db`): o lock do SQLite em drvfs não é confiável, a sincronização pode travar ou reverter o arquivo, e erro de escrita só vira warning no log |
+
+### GitHub App
+
+A fábrica acessa o GitHub como um GitHub App, não com um token pessoal.
+
+1. Crie o App na conta/org dos repos, **sem webhook**, com as permissões **Contents: Read and
+   write**, **Pull requests: Read and write** e **Metadata: Read**.
+2. Instale o App só nos repos da fábrica: a instalação é a lista de repos permitidos.
+3. Gere e baixe a private key (`.pem`) e preencha `GITHUB_APP_ID` e `GITHUB_APP_PRIVATE_KEY_PATH`.
+
+O worker gera, por issue, um token de instalação restrito ao repo dela (validade de 1h, renovado
+com 10 min de margem). Ao trocar o `GITHUB_TOKEN` por este App (ou ao mudar assinaturas de
+activities), faça o deploy do worker sem nenhum `plan-issue-*`, `implement-issue-*` ou
+`review-issue-*` rodando.
+
+### Repo de cada projeto
+
+Não há repo fixo: cada issue diz em qual repo a fábrica trabalha, pelo projeto do Linear em que ela
+está.
+
+1. Nos **Resources** do projeto no Linear, adicione um link para o repo do GitHub
+   (`https://github.com/<owner>/<repo>`; variantes como `.git`, `/tree/main` ou `www.` também
+   valem). O projeto precisa ter links para **exatamente um** repo.
+2. Na raiz do repo, na **branch default**, crie um `.factory.toml` com o comando que roda os testes
+   no sandbox (exit 0 = verde; a PR só abre com verde):
+
+   ```toml
+   test_command = "uv pip install --system -e \".[dev]\" && python -m pytest"
+   ```
+
+3. O GitHub App precisa estar instalado nesse repo.
+
+Um anexo da issue que aponta para `https://github.com/<owner>/<repo>/tree/factory/<...>` (o "pin")
+vence o link do projeto; para trocar o repo de uma issue com pin, apague o anexo. Cada workflow
+resolve o repo uma vez, no início (o planejamento antes de mover a issue para `In Planning`; a
+implementação e a review logo depois de conferir o status). Se não der para resolver (issue sem
+projeto, projeto sem link ou com mais de um repo, repo sem acesso ou sem `.factory.toml` válido), o
+workflow comenta o motivo na issue e falha. Corrija o link ou o `.factory.toml` e dispare a etapa
+de novo: no planejamento, remova e adicione de novo a label `Feature`/`Bug`; na implementação e na
+review, tire a issue do status (`In Progress` / `In Review`) e volte para ele. O `.factory.toml` é
+um arquivo sensível na review: PR que o muda só é mergeada com confirmação de uma pessoa.
 
 ### Aviso de uso da sessão do Claude
 
@@ -136,8 +177,33 @@ que o Claude Code emite no stream-json de toda sessão (planejamento, implementa
 e review). Quando a janela de 5 horas da assinatura passa de 80%, ele manda um email com o percentual
 e o horário em que o limite reseta. Sai um email por janela, mesmo com várias sessões em paralelo:
 o `UsageAlertWorkflow` tem id `usage-alert-five-hour-<resetsAt>` e o Temporal recusa o segundo.
-Limitações: com `ANTHROPIC_API_KEY` não há sessão e o aviso não dispara; a saída de `TEST_COMMAND`
-não é monitorada; um retry do envio depois de um SMTP que deu certo pode duplicar o email.
+Limitações: com `ANTHROPIC_API_KEY` não há sessão e o aviso não dispara; a saída do comando de
+testes não é monitorada; um retry do envio depois de um SMTP que deu certo pode duplicar o email.
+
+### Relatório de tokens
+
+Toda sessão do Claude (menos `run_tests`) grava no SQLite (`TOKEN_USAGE_DB`) os tokens de input,
+output, cache write e cache read, o custo estimado e o modelo. No fim do planejamento, da implementação
+e da review o worker cria ou edita **um comentário por issue** no Linear com os totais por etapa; no
+merge (issue em `Done`) o comentário ganha a linha `Total:`. Workflow que falha não publica, mas os
+registros entram no próximo comentário; falha ao publicar só gera um warning.
+
+Com `CLAUDE_CODE_OAUTH_TOKEN` o relatório também mostra a parcela da janela de 5 horas usada pela sessão
+(`max(last) - min(first)` por `resetsAt`). É uma estimativa: inclui outro uso da mesma conta no intervalo
+e tem granularidade de 1%. Sem o evento `result` do stream, os tokens vêm da soma das mensagens
+`assistant` (subconta output) e o registro aparece como `(parcial)`. O arquivo assume um único worker.
+
+```bash
+# tokens e custo por etapa, por issue
+sqlite3 token_usage.db "SELECT issue_id, stage, COUNT(*) sessoes,
+  SUM(input_tokens+output_tokens+cache_creation_tokens+cache_read_tokens) total,
+  SUM(cost_usd) custo FROM sessions GROUP BY issue_id, stage"
+# média de tokens por 1% da janela de 5h (com assinatura); aproximada: sessão que cruza duas janelas conta nos
+# dois grupos e sessões sem amostras da janela ficam de fora
+sqlite3 token_usage.db "SELECT AVG(t / (s*100)) FROM (SELECT SUM(input_tokens+output_tokens+cache_creation_tokens+cache_read_tokens) t,
+  MAX(w.util_last)-MIN(w.util_first) s FROM sessions JOIN session_windows w ON w.session_key = sessions.key
+  GROUP BY sessions.issue_id, sessions.stage, w.resets_at HAVING s > 0)"
+```
 
 ## Worker (Temporal + E2B)
 
@@ -147,15 +213,17 @@ software-factory-worker
 
 Para cada issue aceita pelo webhook, o `PlanIssueWorkflow` (id `plan-issue-<issue id>`):
 
-1. move a issue de `To Do` para `In Planning` no Linear (se ela não estiver em `To Do`, não move
+1. resolve o repo da issue (sem repo, comenta o motivo na issue e falha sem mover a issue);
+2. move a issue de `To Do` para `In Planning` no Linear (se ela não estiver em `To Do`, não move
    e segue planejando);
-2. cria um sandbox E2B (template `claude`);
-3. clona `TARGET_REPO` em `/home/user/repo`;
-4. roda `claude -p` com a skill `writing-plans` (superpowers, vendorizada) para escrever o plano em
+3. cria um sandbox E2B (template `claude`);
+4. clona o repo da issue (ver [Repo de cada projeto](#repo-de-cada-projeto)) em `/home/user/repo`,
+   sem deixar o token no `origin`;
+5. roda `claude -p` com a skill `writing-plans` (superpowers, vendorizada) para escrever o plano em
    `docs/superpowers/plans/<IDENTIFIER>.md` — o Claude só pode ler o repo e escrever esse arquivo;
-5. commita o plano e faz push na branch `factory/<IDENTIFIER>`;
-6. destrói o sandbox (sempre, inclusive em falha);
-7. move a issue para `In Progress`.
+6. commita o plano e faz push na branch `factory/<IDENTIFIER>`;
+7. destrói o sandbox (sempre, inclusive em falha);
+8. move a issue para `In Progress`.
 
 Os status `To Do`, `In Planning` e `In Progress` precisam existir no time da issue (o nome é
 comparado sem diferenciar maiúsculas). Em falha a issue fica no status em que estava, normalmente
@@ -167,14 +235,14 @@ Quando a issue entra em `In Progress` (movida pelo `PlanIssueWorkflow` ou por um
 `ImplementIssueWorkflow` (id `implement-issue-<issue id>`):
 
 1. confere que a issue segue em `In Progress` (senão encerra sem fazer nada) e que os status
-   `In Review` e `In Planning` existem no time;
+   `In Review` e `In Planning` existem no time, e depois resolve o repo da issue;
 2. checa pela API do GitHub se o plano existe em `factory/<IDENTIFIER>`; se não existe, move a
    issue de volta para `In Planning` e encerra, sem criar sandbox;
 3. cria um sandbox E2B e clona a branch `factory/<IDENTIFIER>` (últimos 50 commits) — o `origin` fica sem o token
    (o Claude roda com `Bash` liberado; isso dificulta, mas não impede, que ele chegue ao token,
    já que o push depois roda no mesmo sandbox);
 4. roda `claude -p` para implementar o plano (até 30 min, sem retry);
-5. roda `TEST_COMMAND` no repo (o orquestrador não confia no relato do Claude); estourar o timeout
+5. roda o `test_command` do `.factory.toml` no repo (o orquestrador não confia no relato do Claude); estourar o timeout
    de 10 min conta como vermelho;
 6. com verde, commita o que faltar e faz push na branch (o token só entra no ambiente desse
    comando; commit e push rodam com os hooks do repo desligados); o sandbox é destruído (sempre, inclusive em falha);
@@ -195,7 +263,7 @@ Qualquer outra falha (sandbox, clone, push, a implementação inicial) deixa a i
 Quando a issue entra em `In Review` (movida pelo `ImplementIssueWorkflow` ou por uma pessoa), o
 `ReviewIssueWorkflow` (id `review-issue-<issue id>`) revisa a PR `factory/<IDENTIFIER>`:
 
-1. cria um sandbox e roda primeiro o `TEST_COMMAND` no head clonado; vermelho (checkpoint `wip`,
+1. cria um sandbox e roda primeiro o `test_command` no head clonado; vermelho (checkpoint `wip`,
    push de uma pessoa...) entra no loop de correção, conta rodada e a review recomeça, então nada
    vermelho é revisado nem mergeado;
 2. com os testes verdes, roda **em paralelo** duas lentes só de leitura sobre o diff inteiro da PR:
@@ -210,7 +278,7 @@ Quando a issue entra em `In Review` (movida pelo `ImplementIssueWorkflow` ou por
    para `Done` (se o head mudou desde a review, revisa de novo, e isso conta rodada). A branch
    `factory/<IDENTIFIER>` não é apagada.
 
-**Arquivos sensíveis:** se o diff da PR muda `CLAUDE.md` (em qualquer diretório), qualquer coisa sob `.claude/`, `.github/workflows/`, `pytest.ini`, `tox.ini`, `setup.cfg`, `pyproject.toml`, `conftest.py`, `.pre-commit-config.yaml` e `Makefile`, o merge só acontece depois de uma pessoa
+**Arquivos sensíveis:** se o diff da PR muda `CLAUDE.md` (em qualquer diretório), qualquer coisa sob `.claude/`, `.github/workflows/`, `pytest.ini`, `tox.ini`, `setup.cfg`, `pyproject.toml`, `conftest.py`, `.pre-commit-config.yaml`, `Makefile` e `.factory.toml`, o merge só acontece depois de uma pessoa
 confirmar com um reply na pergunta que o workflow posta (uma vez por sha revisado). A lista é
 calculada pelo orquestrador com `git diff --name-only`, antes de qualquer Claude, porque esses
 arquivos podem mudar o comportamento do próprio revisor, da CI ou dos testes.
@@ -223,10 +291,10 @@ parar, mova a issue para fora de `In Review`.
 Requisitos e ressalvas da review:
 
 - O time do Linear precisa do status `Done`.
-- O token do GitHub precisa poder fazer merge: **Contents** e **Pull requests: Read and write**,
-  que já são necessários.
-- Branch protection que exige aprovação **bloqueia o merge**, porque o autor da PR é o dono do
-  token. Nesse caso o workflow pergunta; aprove ou ajuste a regra.
+- O GitHub App precisa poder fazer merge: **Contents** e **Pull requests: Read and write**
+  (mais **Metadata: Read**), que já são necessários.
+- Branch protection que exige aprovação **bloqueia o merge**: o autor da PR é o bot do GitHub App
+  e a regra continua valendo para ele. Nesse caso o workflow pergunta; aprove ou ajuste a regra.
 - Sugestão: ative "Automatically delete head branches" no repo alvo, já que a fábrica não apaga
   `factory/<IDENTIFIER>`.
 - Ainda não validado em sandbox E2B real: os dois processos `claude` das lentes rodam ao mesmo

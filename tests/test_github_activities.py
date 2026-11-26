@@ -4,16 +4,21 @@ from typing import Any
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
+from software_factory.github.client import GitHubClient, github_clients
 from software_factory.orchestration.github_activities import GitHubActivities
 from software_factory.orchestration.models import (
+    BranchRequest,
     MergeRequest,
     MergeResult,
     PullInfo,
     PullRequestRequest,
+    RepoTarget,
 )
 
 PLAN = "docs/superpowers/plans/ENG-12.md"
 LINEAR_URL = "https://linear.app/acme/issue/ENG-12"
+TARGET = RepoTarget("acme/app", "pytest")
+BRANCH = BranchRequest("ENG-12", TARGET)
 
 
 class FakeGitHubClient:
@@ -69,6 +74,17 @@ class FakeGitHubClient:
         return "https://github.com/acme/app/pull/8"
 
 
+def github(client: FakeGitHubClient, repos: list[str] | None = None) -> GitHubActivities:
+    """GitHubActivities cujo `clients` devolve sempre `client` e registra o repo pedido."""
+
+    async def clients(repo: str) -> Any:
+        if repos is not None:
+            repos.append(repo)
+        return client
+
+    return GitHubActivities(clients)
+
+
 class TestGitHubActivities(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.env = ActivityEnvironment()
@@ -78,7 +94,7 @@ class TestGitHubActivities(unittest.IsolatedAsyncioTestCase):
 
     async def test_plan_exists(self) -> None:
         client = FakeGitHubClient()
-        self.assertTrue(await self.env.run(GitHubActivities(client).plan_exists, "ENG-12"))
+        self.assertTrue(await self.env.run(github(client).plan_exists, BRANCH))
         self.assertEqual(client.calls[0], ("default_branch", None))
         self.assertEqual(client.calls[1], ("get_file", (PLAN, "factory/ENG-12")))
 
@@ -86,28 +102,28 @@ class TestGitHubActivities(unittest.IsolatedAsyncioTestCase):
         for content in (None, "  \n"):
             with self.subTest(content=content):
                 client = FakeGitHubClient(file=content)
-                self.assertFalse(await self.env.run(GitHubActivities(client).plan_exists, "ENG-12"))
+                self.assertFalse(await self.env.run(github(client).plan_exists, BRANCH))
 
     async def test_plan_exists_propagates_repo_access_error(self) -> None:
         error = ApplicationError("GitHub recusou a requisição: HTTP 404", non_retryable=True)
         client = FakeGitHubClient(branch_error=error)
         with self.assertRaises(ApplicationError) as ctx:
-            await self.env.run(GitHubActivities(client).plan_exists, "ENG-12")
+            await self.env.run(github(client).plan_exists, BRANCH)
         self.assertTrue(ctx.exception.non_retryable)
         self.assertNotIn("get_file", self.names(client))
 
     async def test_plan_exists_rejects_bad_identifier(self) -> None:
         client = FakeGitHubClient()
         with self.assertRaises(ApplicationError) as ctx:
-            await self.env.run(GitHubActivities(client).plan_exists, "ENG-12; rm")
+            await self.env.run(github(client).plan_exists, BranchRequest("ENG-12; rm", TARGET))
         self.assertTrue(ctx.exception.non_retryable)
         self.assertEqual(client.calls, [])
 
     async def test_open_pull_request_creates(self) -> None:
         client = FakeGitHubClient()
         url = await self.env.run(
-            GitHubActivities(client).open_pull_request,
-            PullRequestRequest("ENG-12", "Adicionar login", LINEAR_URL),
+            github(client).open_pull_request,
+            PullRequestRequest("ENG-12", "Adicionar login", LINEAR_URL, TARGET),
         )
         self.assertEqual(url, "https://github.com/acme/app/pull/8")
         create = dict(client.calls)["create_pull"]
@@ -120,8 +136,8 @@ class TestGitHubActivities(unittest.IsolatedAsyncioTestCase):
     async def test_open_pull_request_reuses_existing(self) -> None:
         client = FakeGitHubClient(open_pull={"html_url": "https://github.com/acme/app/pull/7"})
         url = await self.env.run(
-            GitHubActivities(client).open_pull_request,
-            PullRequestRequest("ENG-12", "Adicionar login", None),
+            github(client).open_pull_request,
+            PullRequestRequest("ENG-12", "Adicionar login", None, TARGET),
         )
         self.assertEqual(url, "https://github.com/acme/app/pull/7")
         self.assertNotIn("create_pull", self.names(client))
@@ -135,7 +151,7 @@ class TestGitHubActivities(unittest.IsolatedAsyncioTestCase):
             "base": {"ref": "main"},
         }
         client = FakeGitHubClient(open_pull=pull)
-        info = await self.env.run(GitHubActivities(client).pull_request_info, "ENG-12")
+        info = await self.env.run(github(client).pull_request_info, BRANCH)
         self.assertEqual(
             info, PullInfo(7, "https://github.com/acme/app/pull/7", "head123", "main", "base999")
         )
@@ -144,7 +160,7 @@ class TestGitHubActivities(unittest.IsolatedAsyncioTestCase):
 
     async def test_pull_request_info_none_without_open_pull(self) -> None:
         client = FakeGitHubClient()
-        self.assertIsNone(await self.env.run(GitHubActivities(client).pull_request_info, "ENG-12"))
+        self.assertIsNone(await self.env.run(github(client).pull_request_info, BRANCH))
         self.assertNotIn("merge_base", self.names(client))
 
     def merge_pull_data(self, **overrides: Any) -> dict[str, Any]:
@@ -159,10 +175,10 @@ class TestGitHubActivities(unittest.IsolatedAsyncioTestCase):
         return {**pull, **overrides}
 
     def merge_request(self) -> MergeRequest:
-        return MergeRequest("ENG-12", "Adicionar login", 7, "head123")
+        return MergeRequest("ENG-12", "Adicionar login", 7, "head123", TARGET)
 
     async def merge(self, client: FakeGitHubClient) -> MergeResult:
-        return await self.env.run(GitHubActivities(client).merge_pull_request, self.merge_request())
+        return await self.env.run(github(client).merge_pull_request, self.merge_request())
 
     async def test_merge_already_merged_is_noop(self) -> None:
         client = FakeGitHubClient(pull=self.merge_pull_data(merged=True, state="closed"))
@@ -217,6 +233,52 @@ class TestGitHubActivities(unittest.IsolatedAsyncioTestCase):
         )
         client.pull_after_merge_attempt = self.merge_pull_data(head={"sha": "newer"})
         self.assertEqual(await self.merge(client), MergeResult(False, head_changed=True))
+
+    async def test_client_per_target_repo(self) -> None:
+        repos: list[str] = []
+        client = FakeGitHubClient()
+        await self.env.run(
+            github(client, repos).plan_exists,
+            BranchRequest("ENG-12", RepoTarget("acme/api", "x")),
+        )
+        self.assertEqual(repos, ["acme/api"])
+
+    async def test_every_activity_asks_client_for_target_repo(self) -> None:
+        repos: list[str] = []
+        target = RepoTarget("acme/api", "x")
+        client = FakeGitHubClient(
+            open_pull={
+                "number": 7,
+                "html_url": "https://github.com/acme/api/pull/7",
+                "head": {"sha": "head123"},
+                "base": {"ref": "main"},
+            },
+            pull={"merged": True},
+        )
+        activities = github(client, repos)
+        await self.env.run(
+            activities.open_pull_request, PullRequestRequest("ENG-12", "T", None, target)
+        )
+        await self.env.run(activities.pull_request_info, BranchRequest("ENG-12", target))
+        await self.env.run(
+            activities.merge_pull_request, MergeRequest("ENG-12", "T", 7, "head123", target)
+        )
+        self.assertEqual(repos, ["acme/api"] * 3)
+
+
+class TestGitHubClients(unittest.IsolatedAsyncioTestCase):
+    async def test_builds_client_for_repo_with_its_token(self) -> None:
+        asked: list[str] = []
+
+        async def tokens(repo: str) -> str:
+            asked.append(repo)
+            return f"tok-{repo}"
+
+        client = await github_clients(tokens)("acme/api")
+        self.assertIsInstance(client, GitHubClient)
+        self.assertEqual(client.repo, "acme/api")
+        self.assertEqual(client.token, "tok-acme/api")
+        self.assertEqual(asked, ["acme/api"])
 
 
 if __name__ == "__main__":

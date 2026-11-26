@@ -2,13 +2,14 @@ import unittest
 import uuid
 
 from temporalio import activity
-from temporalio.client import Client
+from temporalio.client import Client, WorkflowFailureError
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from software_factory.orchestration.models import (
     AnalyzeRequest,
+    BranchRequest,
     CloneBranchRequest,
     CommentRequest,
     CommitImplementationRequest,
@@ -26,8 +27,12 @@ from software_factory.orchestration.models import (
     ReviewFixRequest,
     ReviewReport,
     ReviewRequest,
+    RepoResolution,
+    RepoTarget,
     ReviewResult,
+    RunTestsRequest,
     TestRunResult,
+    UsageReportRequest,
 )
 from software_factory.orchestration.review_workflow import (
     FOLLOW_UP_TITLE_CAP,
@@ -45,6 +50,7 @@ ISSUE = PlanIssueInput(
     url="https://linear.app/acme/issue/ENG-12",
 )
 PR_URL = "https://github.com/acme/app/pull/7"
+TARGET = RepoTarget("acme/app", "pytest")
 PULL = PullInfo(
     number=7, url=PR_URL, head_sha="head-1", base_ref="main", base_sha="a" * 40
 )
@@ -78,7 +84,11 @@ class FakeReviewActivities:
         fail_review_times: int = 0,
         not_in_review: bool = False,
         fixed_head: str | None = None,
+        fail_upsert: bool = False,
+        repo_problem: str = "",
     ) -> None:
+        self.repo_problem = repo_problem
+        self.fail_upsert = fail_upsert
         # Head clonado sempre igual (ninguém empurrou entre as sessões).
         self.fixed_head = fixed_head
         self.not_in_review = not_in_review
@@ -102,6 +112,8 @@ class FakeReviewActivities:
         self.merge_requests: list[MergeRequest] = []
         self.comments: list[CommentRequest] = []
         self.questions: list[CommentRequest] = []
+        self.pull_requests: list[BranchRequest] = []
+        self.test_requests: list[RunTestsRequest] = []
         self.review_checks = 0
         self.clones = 0
         self.test_runs = 0
@@ -119,9 +131,17 @@ class FakeReviewActivities:
             return True
         return self.review_checks - 1 <= self.stop_after_checks
 
+    @activity.defn(name="resolve_repo")
+    async def resolve_repo(self, issue: PlanIssueInput) -> RepoResolution:
+        self.calls.append("resolve_repo")
+        if self.repo_problem:
+            return RepoResolution(problem=self.repo_problem)
+        return RepoResolution(target=TARGET)
+
     @activity.defn(name="pull_request_info")
-    async def pull_request_info(self, identifier: str) -> PullInfo | None:
+    async def pull_request_info(self, request: BranchRequest) -> PullInfo | None:
         self.calls.append("pull_request_info")
+        self.pull_requests.append(request)
         return None if self.pull_missing else PULL
 
     @activity.defn(name="create_sandbox")
@@ -194,8 +214,9 @@ class FakeReviewActivities:
         return request.comment_id
 
     @activity.defn(name="run_tests")
-    async def run_tests(self, sandbox_id: str) -> TestRunResult:
+    async def run_tests(self, request: RunTestsRequest) -> TestRunResult:
         self.calls.append("run_tests")
+        self.test_requests.append(request)
         self.test_runs += 1
         return TestRunResult(
             passed=self.test_runs not in self.red_test_runs, output="FAILED test_a"
@@ -211,6 +232,18 @@ class FakeReviewActivities:
     async def kill_sandbox(self, sandbox_id: str) -> None:
         self.calls.append("kill_sandbox")
 
+    @activity.defn(name="token_usage_report")
+    async def token_usage_report(self, request: UsageReportRequest) -> str:
+        self.calls.append(f"token_usage_report:final={request.final}")
+        return "relatório"
+
+    @activity.defn(name="upsert_comment")
+    async def upsert_comment(self, request: CommentRequest) -> str:
+        self.calls.append("upsert_comment")
+        if self.fail_upsert:
+            raise ApplicationError("linear fora", non_retryable=True)
+        return request.comment_id
+
 
 class TestReviewIssueWorkflow(unittest.IsolatedAsyncioTestCase):
     async def run_workflow(self, fake: FakeReviewActivities) -> ReviewResult:
@@ -222,6 +255,7 @@ class TestReviewIssueWorkflow(unittest.IsolatedAsyncioTestCase):
                 task_queue=task_queue,
                 workflows=[ReviewIssueWorkflow],
                 activities=[
+                    fake.resolve_repo,
                     fake.move_issue,
                     fake.pull_request_info,
                     fake.create_sandbox,
@@ -236,6 +270,8 @@ class TestReviewIssueWorkflow(unittest.IsolatedAsyncioTestCase):
                     fake.run_tests,
                     fake.commit_implementation,
                     fake.kill_sandbox,
+                    fake.token_usage_report,
+                    fake.upsert_comment,
                 ],
             ):
                 return await env.client.execute_workflow(
@@ -256,6 +292,7 @@ class TestReviewIssueWorkflow(unittest.IsolatedAsyncioTestCase):
             fake.calls,
             [
                 "move_issue:In Review",
+                "resolve_repo",
                 "move_issue:In Review",
                 "pull_request_info",
                 "create_sandbox",
@@ -266,13 +303,65 @@ class TestReviewIssueWorkflow(unittest.IsolatedAsyncioTestCase):
                 "post_comment",
                 "merge_pull_request",
                 "move_issue:Done",
+                "token_usage_report:final=True",
+                "upsert_comment",
             ],
         )
         self.assertEqual(fake.moves[0].require_states, ("Done",))
         self.assertEqual(fake.moves[0].from_state, "In Review")
         self.assertEqual(fake.moves[-1].from_state, "In Review")
-        self.assertEqual(fake.merge_requests, [MergeRequest("ENG-12", ISSUE.title, 7, "sha-1")])
+        self.assertEqual(fake.merge_requests, [MergeRequest("ENG-12", ISSUE.title, 7, "sha-1", TARGET)])
         self.assertEqual(fake.review_requests[0].base_sha, PULL.base_sha)
+
+    async def test_target_reaches_review_activities(self) -> None:
+        fix = finding("fix", "bug")
+        fake = FakeReviewActivities(reports=[ReviewReport("Um bug.", (fix,))])
+        await self.run_workflow(fake)
+        self.assertEqual(fake.pull_requests, [BranchRequest("ENG-12", TARGET)] * 2)
+        # Testes antes de cada review e depois da correção.
+        self.assertEqual(fake.test_requests, [RunTestsRequest("sbx-1", TARGET)] * 3)
+        self.assertEqual([r.target for r in fake.review_requests], [TARGET, TARGET])
+        self.assertEqual([r.target for r in fake.fix_requests], [TARGET])
+        self.assertEqual([c.target for c in fake.commits], [TARGET])
+        self.assertEqual([m.target for m in fake.merge_requests], [TARGET])
+
+    async def test_repo_problem_after_status_check(self) -> None:
+        fake = FakeReviewActivities(repo_problem="o projeto App não tem link para um repo do GitHub")
+        with self.assertRaises(WorkflowFailureError):
+            await self.run_workflow(fake)
+        self.assertEqual(fake.calls, ["move_issue:In Review", "resolve_repo", "post_comment"])
+        self.assertIn("o projeto App não tem link", fake.comments[0].body)
+
+    async def test_skipped_issue_does_not_resolve(self) -> None:
+        fake = FakeReviewActivities(not_in_review=True)
+        await self.run_workflow(fake)
+        self.assertNotIn("resolve_repo", fake.calls)
+
+    async def test_publishes_final_after_done(self) -> None:
+        fake = FakeReviewActivities()
+        await self.run_workflow(fake)
+        self.assertEqual(
+            fake.calls[-3:],
+            ["move_issue:Done", "token_usage_report:final=True", "upsert_comment"],
+        )
+        self.assertNotIn("token_usage_report:final=False", fake.calls)
+
+    async def test_publishes_when_stopped(self) -> None:
+        fake = FakeReviewActivities(
+            reports=[ReviewReport("Bug.", (finding("fix", "bug"),))], stop_after_checks=1
+        )
+        result = await self.run_workflow(fake)
+        self.assertEqual(result.outcome, "stopped")
+        self.assertEqual(
+            fake.calls[-2:], ["token_usage_report:final=False", "upsert_comment"]
+        )
+        self.assertNotIn("token_usage_report:final=True", fake.calls)
+
+    async def test_publish_failure_does_not_fail_workflow(self) -> None:
+        fake = FakeReviewActivities(fail_upsert=True)
+        result = await self.run_workflow(fake)
+        self.assertEqual(result, ReviewResult("ENG-12", "merged", PR_URL))
+        self.assertEqual(fake.moves[-1].to_state, "Done")
 
     async def test_fix_findings_trigger_fix_session_and_rereview(self) -> None:
         fix = finding("fix", "bug")
@@ -324,7 +413,7 @@ class TestReviewIssueWorkflow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(history), 1)
         self.assertIn("testes vermelhos", history[0].summary)
         # sha-1 vermelho, sha-2 análise, sha-3 correção: o merge é do sha-4, revisado e verde.
-        self.assertEqual(fake.merge_requests, [MergeRequest("ENG-12", ISSUE.title, 7, "sha-4")])
+        self.assertEqual(fake.merge_requests, [MergeRequest("ENG-12", ISSUE.title, 7, "sha-4", TARGET)])
 
     async def test_red_head_never_merges_when_stopped(self) -> None:
         fake = FakeReviewActivities(red_test_runs=(1, 2, 3), stop_after_checks=1)
@@ -462,6 +551,13 @@ class TestReviewIssueWorkflow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, ReviewResult("ENG-12", "no_pr"))
         self.assertNotIn("create_sandbox", fake.calls)
 
+    async def test_no_pr_publishes_token_usage(self) -> None:
+        fake = FakeReviewActivities(pull_missing=True)
+        await self.run_workflow(fake)
+        self.assertEqual(
+            fake.calls[-2:], ["token_usage_report:final=False", "upsert_comment"]
+        )
+
     async def test_merge_blocked_asks_human_then_retries(self) -> None:
         fake = FakeReviewActivities(
             merges=[MergeResult(False, reason="não mergeável (dirty)"), MergeResult(True)],
@@ -494,7 +590,7 @@ class TestReviewIssueWorkflow(unittest.IsolatedAsyncioTestCase):
         question_at = fake.calls.index("post_comment") + 1
         self.assertEqual(fake.calls[question_at], "post_comment")
         self.assertLess(question_at, fake.calls.index("merge_pull_request"))
-        self.assertEqual(fake.merge_requests, [MergeRequest("ENG-12", ISSUE.title, 7, "sha-1")])
+        self.assertEqual(fake.merge_requests, [MergeRequest("ENG-12", ISSUE.title, 7, "sha-1", TARGET)])
 
     async def test_sensitive_files_confirmed_sha_is_not_asked_again(self) -> None:
         sensitive = ReviewReport("Tudo certo.", (), sensitive_files=("CLAUDE.md",))

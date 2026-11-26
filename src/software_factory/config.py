@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from software_factory.notify.email import EmailSettings
 
@@ -13,6 +14,13 @@ def _required(name: str) -> str:
     if not value:
         raise RuntimeError(f"{name} não definida")
     return value
+
+
+def _read_private_key(path: str) -> str:
+    try:
+        return Path(path).read_text()
+    except OSError as error:
+        raise RuntimeError(f"GITHUB_APP_PRIVATE_KEY_PATH ilegível: {error}") from error
 
 
 @dataclass(frozen=True)
@@ -37,15 +45,14 @@ class Settings:
 
 @dataclass(frozen=True)
 class FactorySettings:
-    """Configuração do worker: sandbox E2B, Claude Code e repo alvo."""
+    """Configuração do worker: sandbox E2B, Claude Code, GitHub e Linear (o repo vem da issue)."""
 
     e2b_api_key: str
-    github_token: str
-    target_repo: str
+    # GitHub App: id e conteúdo PEM da private key (lido de GITHUB_APP_PRIVATE_KEY_PATH).
+    github_app_id: str
+    github_app_private_key: str = field(repr=False)
     # Personal API key do Linear: muda o status da issue.
     linear_api_key: str
-    # Comando que roda os testes do repo alvo no sandbox (exit 0 = verde).
-    test_command: str
     # Auth do Claude Code no sandbox: exatamente uma das duas (API ou assinatura).
     anthropic_api_key: str | None = None
     claude_code_oauth_token: str | None = None
@@ -54,6 +61,8 @@ class FactorySettings:
     e2b_template: str = "claude"
     # SMTP do aviso de 80% da sessão do Claude; None = aviso desligado (sem SMTP_HOST).
     alert_email: EmailSettings | None = None
+    # SQLite com o uso de tokens por sessão do Claude.
+    token_usage_db: str = "token_usage.db"
 
     def __post_init__(self) -> None:
         if bool(self.anthropic_api_key) == bool(self.claude_code_oauth_token):
@@ -73,12 +82,12 @@ class FactorySettings:
             e2b_api_key=_required("E2B_API_KEY"),
             anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY") or None,
             claude_code_oauth_token=os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or None,
-            github_token=_required("GITHUB_TOKEN"),
-            target_repo=_required("TARGET_REPO"),
+            github_app_id=_required("GITHUB_APP_ID"),
+            github_app_private_key=_read_private_key(_required("GITHUB_APP_PRIVATE_KEY_PATH")),
             linear_api_key=_required("LINEAR_API_KEY"),
-            test_command=_required("TEST_COMMAND"),
             temporal_address=os.environ.get("TEMPORAL_ADDRESS", DEFAULT_TEMPORAL_ADDRESS),
             task_queue=os.environ.get("TASK_QUEUE", DEFAULT_TASK_QUEUE),
             e2b_template=os.environ.get("E2B_TEMPLATE", "claude"),
             alert_email=EmailSettings.from_env(),
+            token_usage_db=os.environ.get("TOKEN_USAGE_DB", "token_usage.db"),
         )
