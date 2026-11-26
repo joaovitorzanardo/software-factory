@@ -191,6 +191,21 @@ uv pip install -e ".[dev]"
 cp .env.example .env   # preencha os segredos (ver abaixo)
 ```
 
+## Docker (tudo com um comando)
+
+```bash
+cp .env.example .env                       # preencha os segredos
+mkdir -p secrets && cp <sua-key>.pem secrets/github-app.pem
+docker compose up --build
+```
+
+Sobe o Temporal (dev server com SQLite em volume; Web UI em http://localhost:8233), ajusta a
+retenção do namespace `default` para 30 dias, o worker e o servidor de webhooks (porta `8000`).
+O compose sobrescreve `TEMPORAL_ADDRESS`, `GITHUB_APP_PRIVATE_KEY_PATH` e `TOKEN_USAGE_DB`; o resto
+vem do `.env`. Para expor o webhook ao Linear, `docker compose --profile tunnel up` sobe também um
+túnel cloudflared: a URL `https://*.trycloudflare.com` aparece em `docker compose logs tunnel` e muda
+a cada subida (para URL fixa, use um túnel nomeado ou ngrok com domínio).
+
 ## Temporal (servidor local)
 
 Em um terminal separado:

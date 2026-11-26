@@ -286,6 +286,10 @@ uvicorn software_factory.api:create_app --factory --env-file .env --reload
 # túnel para o Linear alcançar a máquina local
 ngrok http 8000
 
+# tudo em containers: Temporal (com retenção de 30d), worker e webhooks; .env + secrets/github-app.pem
+# (túnel cloudflared opcional: --profile tunnel). Ver README, seção Docker.
+docker compose up --build
+
 # testes
 PYTHONPATH=src python3 -m unittest discover -s tests
 ```

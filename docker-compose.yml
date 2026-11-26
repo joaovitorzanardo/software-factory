@@ -1,0 +1,88 @@
+name: software-factory
+
+x-app: &app
+  build: .
+  image: software-factory:local
+  env_file: .env
+  restart: unless-stopped
+
+services:
+  temporal:
+    image: temporalio/temporal:latest
+    user: "0:0"
+    command: ["server", "start-dev", "--ip", "0.0.0.0", "--db-filename", "/data/temporal.db"]
+    ports:
+      - "7233:7233"  # Temporal Service
+      - "8233:8233"  # Web UI
+    volumes:
+      - temporal-data:/data
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "localhost:7233"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    restart: unless-stopped
+
+  # Sobe a retenção do namespace default de 24h para 30d (ver README, "Reconciliação no startup").
+  temporal-init:
+    image: temporalio/temporal:latest
+    command: ["operator", "namespace", "update", "--namespace", "default", "--retention", "30d", "--address", "temporal:7233"]
+    depends_on:
+      temporal:
+        condition: service_healthy
+    restart: "no"
+
+  worker:
+    <<: *app
+    command: ["software-factory-worker"]
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      GITHUB_APP_PRIVATE_KEY_PATH: /run/secrets/github_app_key
+      TOKEN_USAGE_DB: /data/token_usage.db
+    secrets:
+      - github_app_key
+    volumes:
+      - token-data:/data
+    depends_on:
+      temporal:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    command: ["software-factory"]
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      HOST: 0.0.0.0
+      PORT: "8000"
+    ports:
+      - "${PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      temporal:
+        condition: service_healthy
+      worker:
+        condition: service_started
+
+  # Opcional: URL HTTPS pública para o webhook do Linear (a URL muda a cada subida; veja os logs).
+  # Ative com `docker compose --profile tunnel up` ou COMPOSE_PROFILES=tunnel no .env.
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    command: ["tunnel", "--no-autoupdate", "--url", "http://api:8000"]
+    profiles: ["tunnel"]
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+secrets:
+  github_app_key:
+    file: ${GITHUB_APP_PRIVATE_KEY_FILE:-./secrets/github-app.pem}
+
+volumes:
+  temporal-data:
+  token-data:
