@@ -511,7 +511,8 @@ class TestSandboxActivities(unittest.IsolatedAsyncioTestCase):
         self.assertIn("claude -p", run["cmd"])
         self.assertIn("--output-format stream-json", run["cmd"])
         self.assertIn("Skill", run["cmd"])
-        self.assertIn("Edit(docs/superpowers/plans/ENG-12.md)", run["cmd"])
+        # Absoluta (//): regra relativa segue o cwd do Bash e nega o Write depois de um `cd`.
+        self.assertIn("Edit(//home/user/repo/docs/superpowers/plans/ENG-12.md)", run["cmd"])
         self.assertNotIn("Bash", run["cmd"])
         self.assertEqual(run["cwd"], REPO_DIR)
         self.assertNotIn("anthropic-key", run["cmd"])

@@ -83,9 +83,11 @@ def plan_branch(identifier: str) -> str:
 
 def plan_command(identifier: str) -> str:
     # A regra Edit(...) cobre também a ferramenta Write; o Claude só escreve o plano.
+    # Caminho absoluto (`//`): uma regra relativa segue o cwd do Bash e, depois de um `cd`
+    # do Claude (Bash só leitura é liberado), deixa de casar e nega o Write do plano.
     return (
         f"cat {PROMPT_PATH} | claude -p --output-format stream-json --verbose"
-        f' --allowedTools "Read,Grep,Glob,Skill,Edit({plan_path(identifier)})"'
+        f' --allowedTools "Read,Grep,Glob,Skill,Edit(/{REPO_DIR}/{plan_path(identifier)})"'
     )
 
 
