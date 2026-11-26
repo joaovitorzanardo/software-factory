@@ -11,6 +11,7 @@ from software_factory.orchestration.models import (
     ReviewFinding,
     ReviewFixRequest,
     ReviewReport,
+    RepoTarget,
     ReviewRequest,
     ReviewRound,
 )
@@ -36,6 +37,7 @@ ISSUE = PlanIssueInput(
     url="https://linear.app/acme/issue/ENG-12",
 )
 BASE_SHA = "a" * 40
+TARGET = RepoTarget("acme/app", "make test")
 
 
 def finding(**overrides: Any) -> dict[str, Any]:
@@ -133,6 +135,7 @@ class TestReviewPrompts(unittest.TestCase):
             sandbox_id="sbx-1",
             issue=ISSUE,
             base_sha=BASE_SHA,
+            target=TARGET,
             history=self.history(),
             clarifications=(Clarification(question="Manter SSO?", answer="Sim, manter SSO."),),
         )
@@ -149,7 +152,7 @@ class TestReviewPrompts(unittest.TestCase):
         self.assertIn("ENG-12", prompt)
 
     def test_correctness_prompt_uses_template_and_base_sha(self) -> None:
-        prompt = build_correctness_prompt(ReviewRequest("sbx-1", ISSUE, BASE_SHA))
+        prompt = build_correctness_prompt(ReviewRequest("sbx-1", ISSUE, BASE_SHA, TARGET))
         self.assertIn("requesting-code-review/code-reviewer.md", prompt)
         self.assertIn(BASE_SHA, prompt)
         self.assertIn("HEAD", prompt)
@@ -158,7 +161,7 @@ class TestReviewPrompts(unittest.TestCase):
         self.assertIn("subagente", prompt)
 
     def test_security_prompt_checks_test_tampering(self) -> None:
-        prompt = build_security_prompt(ReviewRequest("sbx-1", ISSUE, BASE_SHA))
+        prompt = build_security_prompt(ReviewRequest("sbx-1", ISSUE, BASE_SHA, TARGET))
         self.assertIn("afrouxados", prompt)
         self.assertIn(f"{BASE_SHA}..HEAD", prompt)
         self.assertIn(SECURITY_PATH, prompt)
@@ -170,6 +173,7 @@ class TestReviewPrompts(unittest.TestCase):
             issue=ISSUE,
             round=2,
             findings=(ReviewFinding(**finding(detail="Trocar por hmac.compare_digest.")),),
+            target=TARGET,
         )
         prompt = build_review_fix_prompt(request, "make test")
         self.assertIn("afrouxar testes", prompt)
@@ -192,7 +196,9 @@ class TestReviewPrompts(unittest.TestCase):
                 ),
             ),
         )
-        prompt = build_triage_prompt(ReviewRequest("sbx-1", ISSUE, BASE_SHA, history=history))
+        prompt = build_triage_prompt(
+            ReviewRequest("sbx-1", ISSUE, BASE_SHA, TARGET, history=history)
+        )
         for text in (f"resumo {hostile}", f"título {hostile}", f"motivo {hostile}"):
             self.assertIn(_fence(text), prompt)
 
@@ -211,6 +217,7 @@ class TestReviewPrompts(unittest.TestCase):
                     )
                 ),
             ),
+            target=TARGET,
         )
         prompt = build_review_fix_prompt(request, "make test")
         for text in (f"título {hostile}", f"detalhe {hostile}", f"motivo {hostile}"):
@@ -243,6 +250,9 @@ class TestSensitiveFiles(unittest.TestCase):
     def test_no_sensitive_files(self) -> None:
         self.assertEqual(sensitive_files(["src/app.py", "tests/test_app.py"]), ())
         self.assertEqual(sensitive_files([]), ())
+
+    def test_factory_toml_is_sensitive(self) -> None:
+        self.assertEqual(sensitive_files([".factory.toml", "src/a.py"]), (".factory.toml",))
 
     def test_patterns_cover_the_listed_files(self) -> None:
         for pattern in ("CLAUDE.md", ".claude/", ".github/workflows/", "conftest.py", "Makefile"):

@@ -6,7 +6,8 @@ from temporalio.client import Client
 from temporalio.worker import Worker
 
 from software_factory.config import FactorySettings
-from software_factory.github.client import GitHubClient
+from software_factory.github.app import GitHubApp
+from software_factory.github.client import github_clients
 from software_factory.linear.client import LinearClient
 from software_factory.orchestration.activities import SandboxActivities
 from software_factory.orchestration.token_activities import TokenUsageActivities
@@ -17,6 +18,7 @@ from software_factory.orchestration.linear_activities import LinearActivities
 from software_factory.orchestration.notify_activities import NotifyActivities, UsageAlertNotifier
 from software_factory.orchestration.reconcile_activities import ReconcileActivities
 from software_factory.orchestration.reconcile_workflow import ReconcileIssuesWorkflow
+from software_factory.orchestration.repo_activities import RepoActivities
 from software_factory.orchestration.review_activities import ReviewActivities
 from software_factory.orchestration.review_workflow import ReviewIssueWorkflow
 from software_factory.orchestration.usage_alert_workflow import UsageAlertWorkflow
@@ -41,13 +43,22 @@ async def run_worker(settings: FactorySettings) -> None:
     else:
         logger.info("aviso de uso desligado: SMTP_HOST não definida")
     token_store = TokenStore(settings.token_usage_db)
-    activities = SandboxActivities(settings, usage_notifier=notifier, token_store=token_store)
+    github_app = GitHubApp(settings.github_app_id, settings.github_app_private_key)
+    github_tokens = github_app.installation_token
+    clients = github_clients(github_tokens)
+    activities = SandboxActivities(
+        settings,
+        github_tokens,
+        usage_notifier=notifier,
+        token_store=token_store,
+    )
     tokens = TokenUsageActivities(token_store)
     review = ReviewActivities(activities)
     linear_client = LinearClient(settings.linear_api_key)
     linear = LinearActivities(linear_client)
     reconcile = ReconcileActivities(linear_client, client, settings.task_queue)
-    github = GitHubActivities(GitHubClient(settings.github_token, settings.target_repo))
+    github = GitHubActivities(clients)
+    repo = RepoActivities(linear_client, clients)
     worker = Worker(
         client,
         task_queue=settings.task_queue,
@@ -70,6 +81,7 @@ async def run_worker(settings: FactorySettings) -> None:
             linear.post_comment,
             linear.upsert_comment,
             linear.create_issue,
+            linear.attach_link,
             tokens.token_usage_report,
             github.plan_exists,
             github.open_pull_request,
@@ -77,6 +89,7 @@ async def run_worker(settings: FactorySettings) -> None:
             github.merge_pull_request,
             reconcile.list_pending_issues,
             reconcile.start_missed_workflow,
+            repo.resolve_repo,
             *alert_activities,
         ],
     )

@@ -8,14 +8,19 @@ from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from software_factory.orchestration.models import (
+    AttachLinkRequest,
+    CloneRepoRequest,
     CommentRequest,
     CommitPlanRequest,
     MoveIssueRequest,
     PlanIssueInput,
     PlanRequest,
     PlanResult,
+    RepoResolution,
+    RepoTarget,
     UsageReportRequest,
 )
+from software_factory.orchestration.repo_resolution import repo_problem_comment
 from software_factory.orchestration.workflow import PlanIssueWorkflow
 
 ISSUE = PlanIssueInput(
@@ -25,6 +30,7 @@ ISSUE = PlanIssueInput(
     description=None,
     url=None,
 )
+TARGET = RepoTarget("acme/app", "pytest")
 
 
 class FakeActivities:
@@ -34,13 +40,41 @@ class FakeActivities:
         fail_commit: bool = False,
         skip_planning_move: bool = False,
         fail_planning_move: bool = False,
+        repo_problem: str = "",
+        fail_attach: bool = False,
     ) -> None:
+        self.fail_attach = fail_attach
+        self.attachments: list[AttachLinkRequest] = []
+        self.repo_problem = repo_problem
         self.fail_plan = fail_plan
         self.fail_commit = fail_commit
         self.skip_planning_move = skip_planning_move
         self.fail_planning_move = fail_planning_move
         self.calls: list[str] = []
         self.moves: list[MoveIssueRequest] = []
+        self.clone_requests: list[CloneRepoRequest] = []
+        self.commit_requests: list[CommitPlanRequest] = []
+        self.comments: list[CommentRequest] = []
+
+    @activity.defn(name="resolve_repo")
+    async def resolve_repo(self, issue: PlanIssueInput) -> RepoResolution:
+        self.calls.append("resolve_repo")
+        if self.repo_problem:
+            return RepoResolution(problem=self.repo_problem)
+        return RepoResolution(target=TARGET)
+
+    @activity.defn(name="post_comment")
+    async def post_comment(self, request: CommentRequest) -> str:
+        self.calls.append("post_comment")
+        self.comments.append(request)
+        return request.comment_id
+
+    @activity.defn(name="attach_link")
+    async def attach_link(self, request: AttachLinkRequest) -> None:
+        self.calls.append("attach_link")
+        self.attachments.append(request)
+        if self.fail_attach:
+            raise ApplicationError("issue não encontrada", non_retryable=True)
 
     @activity.defn(name="move_issue")
     async def move_issue(self, request: MoveIssueRequest) -> bool:
@@ -59,8 +93,9 @@ class FakeActivities:
         return "sbx-1"
 
     @activity.defn(name="clone_repo")
-    async def clone_repo(self, sandbox_id: str) -> None:
+    async def clone_repo(self, request: CloneRepoRequest) -> None:
         self.calls.append("clone_repo")
+        self.clone_requests.append(request)
 
     @activity.defn(name="generate_plan")
     async def generate_plan(self, request: PlanRequest) -> str:
@@ -72,6 +107,7 @@ class FakeActivities:
     @activity.defn(name="commit_plan")
     async def commit_plan(self, request: CommitPlanRequest) -> str:
         self.calls.append("commit_plan")
+        self.commit_requests.append(request)
         if self.fail_commit:
             raise RuntimeError("push falhou")
         return f"factory/{request.identifier}"
@@ -100,7 +136,10 @@ class TestPlanIssueWorkflow(unittest.IsolatedAsyncioTestCase):
                 task_queue=task_queue,
                 workflows=[PlanIssueWorkflow],
                 activities=[
+                    fake.resolve_repo,
+                    fake.post_comment,
                     fake.move_issue,
+                    fake.attach_link,
                     fake.create_sandbox,
                     fake.clone_repo,
                     fake.generate_plan,
@@ -132,12 +171,14 @@ class TestPlanIssueWorkflow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             fake.calls,
             [
+                "resolve_repo",
                 "move_issue:In Planning",
                 "create_sandbox",
                 "clone_repo",
                 "generate_plan",
                 "commit_plan",
                 "kill_sandbox",
+                "attach_link",
                 "token_usage_report:final=False",
                 "upsert_comment",
                 "move_issue:In Progress",
@@ -160,10 +201,11 @@ class TestPlanIssueWorkflow(unittest.IsolatedAsyncioTestCase):
         fake = FakeActivities()
         await self.run_workflow(fake)
         self.assertEqual(
-            fake.calls[-5:],
+            fake.calls[-6:],
             [
                 "commit_plan",
                 "kill_sandbox",
+                "attach_link",
                 "token_usage_report:final=False",
                 "upsert_comment",
                 "move_issue:In Progress",
@@ -180,7 +222,7 @@ class TestPlanIssueWorkflow(unittest.IsolatedAsyncioTestCase):
         fake = FakeActivities(fail_planning_move=True)
         with self.assertRaises(WorkflowFailureError):
             await self.run_workflow(fake)
-        self.assertEqual(fake.calls, ["move_issue:In Planning"])
+        self.assertEqual(fake.calls, ["resolve_repo", "move_issue:In Planning"])
 
     async def test_kills_sandbox_on_failure(self) -> None:
         fake = FakeActivities(fail_plan=True)
@@ -197,6 +239,56 @@ class TestPlanIssueWorkflow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake.calls[-1], "kill_sandbox")
         self.assertIn("commit_plan", fake.calls)
         self.assertNotIn("move_issue:In Progress", fake.calls)
+
+    async def test_happy_path_passes_target(self) -> None:
+        fake = FakeActivities()
+        await self.run_workflow(fake)
+        self.assertEqual(fake.calls[0], "resolve_repo")
+        self.assertEqual(fake.clone_requests, [CloneRepoRequest("sbx-1", TARGET)])
+        self.assertEqual(fake.commit_requests[0].target, TARGET)
+
+    async def test_pins_repo_after_commit(self) -> None:
+        fake = FakeActivities()
+        await self.run_workflow(fake)
+        self.assertEqual(
+            fake.attachments,
+            [
+                AttachLinkRequest(
+                    "issue-1",
+                    "https://github.com/acme/app/tree/factory/ENG-12",
+                    "factory/ENG-12",
+                    "acme/app",
+                )
+            ],
+        )
+        self.assertLess(fake.calls.index("kill_sandbox"), fake.calls.index("attach_link"))
+        self.assertLess(
+            fake.calls.index("attach_link"), fake.calls.index("token_usage_report:final=False")
+        )
+
+    async def test_pin_failure_still_moves_to_in_progress(self) -> None:
+        fake = FakeActivities(fail_attach=True)
+        result = await self.run_workflow(fake)
+        self.assertEqual(result.branch, "factory/ENG-12")
+        self.assertEqual(fake.calls[-1], "move_issue:In Progress")
+
+    async def test_repo_problem_comments_and_fails(self) -> None:
+        fake = FakeActivities(repo_problem="o projeto App não tem link para um repo do GitHub")
+        with self.assertRaises(WorkflowFailureError):
+            await self.run_workflow(fake)
+        # Nem move_issue, nem sandbox.
+        self.assertEqual(fake.calls, ["resolve_repo", "post_comment"])
+        self.assertEqual(fake.comments[0].issue_id, "issue-1")
+        self.assertIn("o projeto App não tem link", fake.comments[0].body)
+
+
+class TestRepoProblemComment(unittest.TestCase):
+    def test_names_problem_and_how_to_fix(self) -> None:
+        body = repo_problem_comment("o projeto App não tem link")
+        self.assertTrue(body.startswith("**software-factory não sabe em qual repo trabalhar.**"))
+        self.assertIn("\n\no projeto App não tem link\n\n", body)
+        self.assertIn("`.factory.toml` na branch default do repo", body)
+        self.assertIn("dispare a etapa de novo", body)
 
 
 if __name__ == "__main__":

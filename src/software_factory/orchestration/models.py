@@ -9,6 +9,18 @@ STATE_DONE = "Done"
 
 
 @dataclass(frozen=True)
+class RepoTarget:
+    repo: str  # owner/repo
+    test_command: str
+
+
+@dataclass(frozen=True)
+class RepoResolution:
+    target: RepoTarget | None = None
+    problem: str = ""  # motivo (pt-BR) de não ter resolvido o repo
+
+
+@dataclass(frozen=True)
 class PlanIssueInput:
     issue_id: str
     identifier: str
@@ -27,6 +39,7 @@ class PlanRequest:
 class CommitPlanRequest:
     sandbox_id: str
     identifier: str
+    target: RepoTarget
 
 
 @dataclass(frozen=True)
@@ -35,6 +48,14 @@ class PlanResult:
     plan: str
     sandbox_id: str
     branch: str
+
+
+@dataclass(frozen=True)
+class AttachLinkRequest:
+    issue_id: str
+    url: str
+    title: str
+    subtitle: str
 
 
 @dataclass(frozen=True)
@@ -52,18 +73,39 @@ class PullRequestRequest:
     identifier: str
     title: str
     url: str | None
+    target: RepoTarget
 
 
 @dataclass(frozen=True)
 class CloneBranchRequest:
     sandbox_id: str
     identifier: str
+    target: RepoTarget
+
+
+@dataclass(frozen=True)
+class CloneRepoRequest:
+    sandbox_id: str
+    target: RepoTarget
+
+
+@dataclass(frozen=True)
+class RunTestsRequest:
+    sandbox_id: str
+    target: RepoTarget
+
+
+@dataclass(frozen=True)
+class BranchRequest:
+    identifier: str
+    target: RepoTarget
 
 
 @dataclass(frozen=True)
 class ImplementRequest:
     sandbox_id: str
     issue: PlanIssueInput
+    target: RepoTarget
 
 
 @dataclass(frozen=True)
@@ -79,6 +121,7 @@ class CommitImplementationRequest:
     identifier: str
     # Commit clonado de factory/<ID>: HEAD igual a ele = Claude não mudou nada.
     base_sha: str
+    target: RepoTarget
     # Vazio: "feat: implementa <ID>".
     message: str = ""
     # False: sem mudanças devolve a branch sem push (checkpoint opcional).
@@ -104,6 +147,7 @@ class AnalyzeRequest:
     sandbox_id: str
     issue: PlanIssueInput
     test_output: str
+    target: RepoTarget
     attempts: tuple[FixAttempt, ...] = ()
     clarifications: tuple[Clarification, ...] = ()
 
@@ -122,6 +166,7 @@ class FixRequest:
     issue: PlanIssueInput
     analysis: str
     plan: str
+    target: RepoTarget
     clarifications: tuple[Clarification, ...] = ()
 
 
@@ -204,6 +249,7 @@ class ReviewRequest:
     sandbox_id: str
     issue: PlanIssueInput
     base_sha: str
+    target: RepoTarget
     history: tuple[ReviewRound, ...] = ()
     clarifications: tuple[Clarification, ...] = ()
 
@@ -222,6 +268,7 @@ class ReviewFixRequest:
     issue: PlanIssueInput
     round: int
     findings: tuple[ReviewFinding, ...]
+    target: RepoTarget
     clarifications: tuple[Clarification, ...] = ()
 
 
@@ -231,6 +278,7 @@ class MergeRequest:
     title: str
     number: int
     head_sha: str
+    target: RepoTarget
 
 
 @dataclass(frozen=True)

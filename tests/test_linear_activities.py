@@ -9,6 +9,7 @@ from temporalio.testing import ActivityEnvironment
 from software_factory.linear.client import LinearClient
 from software_factory.orchestration.linear_activities import LinearActivities
 from software_factory.orchestration.models import (
+    AttachLinkRequest,
     CommentRequest,
     CreateIssueRequest,
     FollowUpIssue,
@@ -317,6 +318,61 @@ class TestCreateIssue(unittest.IsolatedAsyncioTestCase):
                 {"data": {"issues": {"nodes": []}}},
                 {"data": {"issue": {"team": {"id": "team-1"}}}},
                 {"data": {"issueCreate": {"success": False, "issue": None}}},
+            )
+        self.assertFalse(ctx.exception.non_retryable)
+
+
+class TestAttachLink(unittest.IsolatedAsyncioTestCase):
+    URL = "https://github.com/acme/app/tree/factory/ENG-12"
+    REQUEST = AttachLinkRequest("issue-1", URL, "factory/ENG-12", "acme/app")
+
+    def setUp(self) -> None:
+        self.requests: list[httpx.Request] = []
+        self.responses: list[dict[str, Any]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.requests.append(request)
+            return httpx.Response(200, json=self.responses.pop(0))
+
+        client = LinearClient("lin-key", transport=httpx.MockTransport(handler))
+        self.activities = LinearActivities(client)
+
+    async def run_attach(self, *responses: dict[str, Any]) -> None:
+        self.responses.extend(responses)
+        await ActivityEnvironment().run(self.activities.attach_link, self.REQUEST)
+
+    async def test_attach_link_creates(self) -> None:
+        await self.run_attach(
+            {"data": {"issue": {"attachments": {"nodes": []}}}},
+            {"data": {"attachmentCreate": {"success": True}}},
+        )
+        self.assertEqual(len(self.requests), 2)
+        variables = json.loads(self.requests[1].content)["variables"]
+        self.assertEqual(
+            variables["input"],
+            {
+                "issueId": "issue-1",
+                "url": self.URL,
+                "title": "factory/ENG-12",
+                "subtitle": "acme/app",
+            },
+        )
+
+    async def test_attach_link_existing_url_skips_mutation(self) -> None:
+        await self.run_attach({"data": {"issue": {"attachments": {"nodes": [{"url": self.URL}]}}}})
+        self.assertEqual(len(self.requests), 1)
+
+    async def test_attach_link_issue_not_found_non_retryable(self) -> None:
+        with self.assertRaises(ApplicationError) as ctx:
+            await self.run_attach({"data": {"issue": None}})
+        self.assertTrue(ctx.exception.non_retryable)
+        self.assertEqual(len(self.requests), 1)
+
+    async def test_attach_link_unsuccessful_raises(self) -> None:
+        with self.assertRaises(ApplicationError) as ctx:
+            await self.run_attach(
+                {"data": {"issue": {"attachments": {"nodes": []}}}},
+                {"data": {"attachmentCreate": {"success": False}}},
             )
         self.assertFalse(ctx.exception.non_retryable)
 

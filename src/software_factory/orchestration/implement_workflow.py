@@ -12,12 +12,14 @@ with workflow.unsafe.imports_passed_through():
         STATE_IN_PLANNING,
         STATE_IN_PROGRESS,
         STATE_IN_REVIEW,
+        BranchRequest,
         HumanAnswer,
         ImplementResult,
         MoveIssueRequest,
         PlanIssueInput,
         PullRequestRequest,
     )
+    from software_factory.orchestration.repo_resolution import resolve_target
     from software_factory.orchestration.token_reporting import publish_token_usage
     from software_factory.orchestration.sessions import (  # noqa: F401 (reexportados)
         ANALYSIS_CAP,
@@ -66,11 +68,12 @@ class ImplementIssueWorkflow(SessionWorkflow):
         if not still_in_progress:
             workflow.logger.info("%s saiu de %s; não implementa", issue.identifier, STATE_IN_PROGRESS)
             return ImplementResult(issue.identifier, OUTCOME_SKIPPED)
+        self._target = await resolve_target(issue)
 
         # Checado antes de gastar um sandbox.
         has_plan: bool = await workflow.execute_activity(
             "plan_exists",
-            issue.identifier,
+            BranchRequest(issue.identifier, self.target),
             start_to_close_timeout=timedelta(seconds=30),
             retry_policy=RetryPolicy(maximum_attempts=5),
             result_type=bool,
@@ -95,7 +98,9 @@ class ImplementIssueWorkflow(SessionWorkflow):
         # Verde: o commit final já foi empurrado pela última sessão.
         pr_url: str = await workflow.execute_activity(
             "open_pull_request",
-            PullRequestRequest(identifier=issue.identifier, title=issue.title, url=issue.url),
+            PullRequestRequest(
+                identifier=issue.identifier, title=issue.title, url=issue.url, target=self.target
+            ),
             start_to_close_timeout=timedelta(seconds=30),
             retry_policy=RetryPolicy(maximum_attempts=5),
             result_type=str,
