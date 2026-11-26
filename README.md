@@ -18,7 +18,16 @@ roda os testes e, se ficarem vermelhos, entra num loop de análise e correção 
 só então abre o PR e move a issue para `In Review`. Em `In Review`, revisa a PR, corrige o que a
 review apontar e, aprovada, faz o merge **sem humano** (salvo arquivos sensíveis, que pedem
 confirmação) e move a issue para `Done`. Dúvidas grandes viram comentário na issue, e a resposta é
-um reply nesse comentário.
+um reply nesse comentário. Achados da review que não bloqueiam o merge podem virar issues de
+follow-up no Linear.
+
+Além disso, ao subir, o servidor de webhooks **reconcilia** as issues cujos eventos se perderam
+enquanto ele estava fora, e o worker pode mandar um **email** quando a sessão do Claude passa de
+80% da janela de uso. Cada etapa publica na issue um comentário com os tokens e o custo
+estimado das sessões do Claude.
+
+Não há repo fixo: cada issue é resolvida para o repo linkado no seu projeto do Linear, com o
+comando de testes vindo do `.factory.toml` desse repo (ver [Repo de cada projeto](#repo-de-cada-projeto)).
 
 Quem faz o trabalho "inteligente" é o **Claude Code**, rodando dentro de uma máquina isolada e
 descartável (sandbox do **E2B**). Quem coordena os passos, tenta de novo quando algo falha e
@@ -26,50 +35,146 @@ garante que nada fique pela metade é o **Temporal**.
 
 ## Como funciona hoje
 
+São três processos: o **servidor de webhooks** (FastAPI), que recebe os eventos do Linear e
+inicia workflows no Temporal; o **servidor do Temporal**, que guarda o estado de cada workflow; e
+o **worker**, que executa os workflows e as activities (Linear, GitHub, E2B, email, SQLite de tokens). O status da
+issue no Linear é o que move a fábrica de uma etapa para a outra:
+
+`To Do` → `In Planning` → `In Progress` → `In Review` → `Done`
+
+| Workflow | Id | Começa quando | Termina |
+| --- | --- | --- | --- |
+| `PlanIssueWorkflow` | `plan-issue-<issue id>` | issue criada com label `Feature`/`Bug`, ou recebe uma | plano commitado; issue em `In Progress` |
+| `ImplementIssueWorkflow` | `implement-issue-<issue id>` | issue entra em `In Progress` | testes verdes, PR aberta; issue em `In Review` |
+| `ReviewIssueWorkflow` | `review-issue-<issue id>` | issue entra em `In Review` | PR mergeada (squash); issue em `Done` |
+| `ReconcileIssuesWorkflow` | `reconcile-issues` | startup do servidor de webhooks | workflows perdidos iniciados |
+| `UsageAlertWorkflow` | `usage-alert-five-hour-<resetsAt>` | sessão do Claude passa de 80% da janela de 5h | email enviado |
+
+### Visão geral
+
+```mermaid
+flowchart LR
+    L[("Linear<br/>issues e comentários")]
+    subgraph SRV["Servidor de webhooks · FastAPI"]
+        WH["POST /webhooks/linear"]
+        ST["startup: reconciliação"]
+    end
+    T[("Temporal<br/>localhost:7233")]
+    subgraph WK["Worker do Temporal"]
+        WF["Workflows<br/>Plan · Implement · Review<br/>Reconcile · UsageAlert"]
+        AC["Activities"]
+    end
+    E2B["Sandbox E2B<br/>Claude Code + git<br/>um por sessão"]
+    GH[("GitHub<br/>repo do projeto · GitHub App")]
+    M["Email SMTP<br/>aviso de 80% da sessão"]
+    DB[("SQLite<br/>tokens por sessão")]
+
+    L -- "webhook: issue criada ou atualizada,<br/>reply num comentário" --> WH
+    WH -- "inicia workflow ou<br/>envia signal human_answer" --> T
+    ST -- "inicia ReconcileIssuesWorkflow" --> T
+    T <--> WF
+    WF --> AC
+    AC -- "cria, executa e destrói" --> E2B
+    E2B -- "clone e push da<br/>branch factory/IDENTIFIER" --> GH
+    AC -- "GraphQL: status, comentários,<br/>issues de follow-up, varredura" --> L
+    AC -- "REST com token de instalação:<br/>.factory.toml, plano, PR, merge" --> GH
+    AC -- "grava tokens" --> DB
+    AC -. "opcional" .-> M
+```
+
+### Ciclo de uma issue
+
 ```mermaid
 flowchart TD
-    A([Pessoa cria ou edita issue no Linear<br/>com label Feature ou Bug]) --> B[Linear envia webhook]
-    B --> C{Servidor de webhooks<br/>assinatura válida e<br/>label Feature/Bug?}
-    C -- não --> C1([Ignora e responde 200])
-    C -- "label adicionada<br/>ou issue criada" --> D{Já existe workflow<br/>para essa issue?}
-    C -- "status mudou para<br/>In Progress" --> P{Já existe workflow<br/>de implementação?}
-    D -- sim --> D1([Responde duplicate])
-    D -- não --> E[Inicia PlanIssueWorkflow<br/>no Temporal]
-    P -- sim --> D1
-    P -- não --> Q[Inicia ImplementIssueWorkflow<br/>no Temporal]
+    A(["Pessoa cria ou edita issue no Linear<br/>com label Feature ou Bug"]) --> W{"Webhook do Linear<br/>assinatura e timestamp válidos?"}
+    W -- "não" --> W0(["401 / 400"])
+    W -- "evento sem gatilho" --> W1(["200 ignored"])
+    W -- "issue criada ou<br/>label adicionada" --> P0
+    W -- "status mudou para<br/>In Progress" --> I0
+    W -- "status mudou para<br/>In Review" --> R0
+    W -- "reply num comentário" --> SIG(["signal human_answer para os<br/>workflows de implementação e review"])
 
-    subgraph W[Worker do Temporal: planejamento]
-        E --> F{Issue está em To Do?}
-        F -- sim --> F1[Move a issue para In Planning]
-        F -- não --> G
-        F1 --> G[Cria sandbox E2B]
-        G --> H[Clona o repositório alvo]
-        H --> I[Claude Code escreve o plano<br/>com a skill writing-plans]
-        I --> J[Commit e push do plano na<br/>branch factory/IDENTIFIER]
-        J --> K[Destrói o sandbox<br/>sempre, mesmo em falha]
-        K --> L[Move a issue para In Progress]
+    subgraph PLAN["PlanIssueWorkflow"]
+        P0[["Resolve o repo da issue"]] --> P0b["To Do → In Planning<br/>só se estiver em To Do"]
+        P0b --> P1["Sandbox: clona o repo da issue"]
+        P1 --> P2["Claude Code escreve o plano<br/>skill writing-plans"]
+        P2 --> P3["Commit e push do plano em<br/>factory/IDENTIFIER"]
+        P3 --> P4["Destrói o sandbox<br/>sempre, mesmo em falha"]
+        P4 --> P4b["Anexa o pin factory/IDENTIFIER<br/>e publica o comentário de tokens"]
+        P4b --> P5["Move para In Progress"]
     end
 
-    L -. webhook de status .-> B
+    P5 -. "webhook de status" .-> W
 
-    subgraph X[Worker do Temporal: implementação]
-        Q --> R{Issue ainda em<br/>In Progress?}
-        R -- não --> R1([Encerra sem fazer nada])
-        R -- sim --> S{Plano existe em<br/>factory/IDENTIFIER?}
-        S -- não --> S1([Move a issue de volta<br/>para In Planning])
-        S -- sim --> T[Cria sandbox E2B]
-        T --> U[Clona a branch factory/IDENTIFIER]
-        U --> V[Claude Code implementa o plano]
-        V --> Y{Testes verdes?}
-        Y -- não --> Y1[Checkpoint wip na branch;<br/>Claude analisa e corrige<br/>em novos sandboxes]
-        Y1 -. pergunta no Linear,<br/>reply da pessoa .-> Y1
-        Y1 --> Y
-        Y -- sim --> Z[Commit e push na branch]
-        Z --> Z1[Destrói o sandbox<br/>sempre, mesmo em falha]
-        Z1 --> Z2[Abre o Pull Request]
-        Z2 --> Z3([Move a issue para In Review])
+    subgraph IMPL["ImplementIssueWorkflow"]
+        I0{"Ainda em<br/>In Progress?"} -- "não" --> I0x(["Encerra"])
+        I0 -- "sim" --> I0r[["Resolve o repo da issue"]]
+        I0r --> I1{"Plano existe em<br/>factory/IDENTIFIER?"}
+        I1 -- "não" --> I1x(["Volta para In Planning"])
+        I1 -- "sim" --> I2["Sandbox: Claude Code<br/>implementa o plano"]
+        I2 --> I3{"test_command<br/>verde?"}
+        I3 -- "não" --> FIX1[["Loop de correção"]]
+        FIX1 --> I4
+        I3 -- "sim" --> I4["Commit e push na branch"]
+        I4 --> I5["Abre o Pull Request"]
+        I5 --> I5b["Publica o comentário de tokens"]
+        I5b --> I6["Move para In Review"]
+    end
+
+    I6 -. "webhook de status" .-> W
+
+    subgraph REV["ReviewIssueWorkflow"]
+        R0{"Ainda em<br/>In Review?"} -- "não" --> R0x(["Encerra"])
+        R0 -- "sim" --> R0r[["Resolve o repo da issue"]]
+        R0r --> R0p{"PR aberta de<br/>factory/IDENTIFIER?"}
+        R0p -- "não" --> R0x
+        R0p -- "sim" --> R1{"test_command verde<br/>no head da PR?"}
+        R1 -- "não" --> FIX2[["Loop de correção"]]
+        FIX2 --> R1
+        R1 -- "sim" --> R2["Lentes correctness e security<br/>em paralelo + triagem"]
+        R2 --> R3["Follow-ups no Linear<br/>e comentário de resumo"]
+        R3 --> R4{"Decisão da triagem"}
+        R4 -- "ask" --> R4q["Pergunta no Linear<br/>e espera o reply"]
+        R4q --> R1
+        R4 -- "fix" --> R5["Sandbox: corrige,<br/>roda os testes e faz push"]
+        R5 --> R1
+        R4 -- "só issue, note<br/>ou reject" --> R6{"Arquivos sensíveis<br/>no diff?"}
+        R6 -- "sim" --> R7["Pergunta no Linear<br/>e espera a confirmação"]
+        R7 --> R8
+        R6 -- "não" --> R8["Merge squash<br/>no sha revisado"]
+        R8 -- "head mudou" --> R1
+        R8 -- "merge feito" --> R9(["Move para Done e fecha o<br/>comentário de tokens com o Total"])
     end
 ```
+
+"Resolve o repo" usa o pin anexado à issue ou, sem ele, o link do projeto e o `.factory.toml`; se
+falhar, o workflow comenta o motivo na issue e falha.
+
+Depois de `MAX_REVIEW_ROUNDS = 3` rodadas sem merge, ou se o GitHub recusar o merge (conflito,
+branch protection), a review também pergunta no Linear antes de seguir.
+
+### Loop de correção
+
+Usado pela implementação e pela review sempre que o `test_command` do `.factory.toml` fica vermelho. Cada sessão
+(análise ou correção) roda num sandbox novo e deixa um checkpoint `wip` na branch.
+
+```mermaid
+flowchart LR
+    V(["Testes vermelhos<br/>checkpoint wip na branch"]) --> S{"Issue segue no<br/>status da etapa?"}
+    S -- "não" --> X(["Para, sem PR e sem merge"])
+    S -- "sim" --> N{"5 correções<br/>seguidas sem verde?"}
+    N -- "sim" --> Q["Pergunta no Linear<br/>e espera o reply"]
+    N -- "não" --> A["Sandbox: análise da falha<br/>skill systematic-debugging"]
+    Q --> A
+    A -- "dúvida que só<br/>uma pessoa resolve" --> Q
+    A -- "análise e plano<br/>de correção" --> F["Sandbox: corrige,<br/>roda os testes e faz push"]
+    F -- "vermelho" --> S
+    F -- "verde" --> G(["Volta à etapa"])
+```
+
+Toda pergunta vira um comentário na issue; a resposta é um **reply na thread desse comentário**.
+Sem resposta em 7 dias o workflow falha. Para parar uma etapa, mova a issue para fora do status
+dela.
 
 ## Requisitos
 
